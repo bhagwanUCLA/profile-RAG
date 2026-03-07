@@ -2,4 +2,4 @@ __pycache__/
 scraper_cache/
 *.pyc
 .env
-frontend.html
+/frontend
