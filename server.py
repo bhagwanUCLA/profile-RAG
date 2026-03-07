@@ -1,23 +1,33 @@
 """
 server.py
 ---------
-FastAPI backend that exposes the RAG pipeline over HTTP.
-The React frontend connects to this.
+FastAPI backend for the Portfolio RAG pipeline.
+
+New in this version
+-------------------
+- Conversational chat: every /query/stream call accepts a `session_id`.
+  Passing the same session_id across requests makes the LLM remember
+  previous turns (Gemini via chats.create, Claude via message history).
+- Claude model support: any model name starting with "claude" is routed
+  through the Anthropic SDK.
+- GET /sessions              — list active session ids
+- DELETE /sessions/{id}      — clear a specific session
+- DELETE /sessions           — clear all sessions
 
 Endpoints
 ---------
 POST /ingest          — scrape & index a portfolio URL
-POST /rebuild         — rebuild FAISS index from cache (no network calls)
-POST /query           — semantic search, returns chunks + Gemini answer
-GET  /query/stream    — same but streams Gemini tokens as SSE
+POST /config          — update pipeline config
+GET  /config          — read current config
+GET  /query/stream    — SSE streaming query (pass session_id for chat)
+POST /query           — single-shot query
 GET  /stats           — cache + index statistics
-GET  /cache/clear     — wipe scraper cache
-POST /index/clear     — wipe FAISS index
-
-Run
----
-    pip install fastapi uvicorn[standard]
-    uvicorn server:app --reload --port 8000
+DELETE /cache         — wipe scraper cache
+DELETE /index         — wipe FAISS index
+GET  /sessions        — list sessions
+DELETE /sessions/{id} — clear one session
+DELETE /sessions      — clear all sessions
+GET  /health          — liveness probe
 """
 
 from __future__ import annotations
@@ -38,16 +48,13 @@ from orchestrator import RAGOrchestrator
 from rag_query import GeminiRAG
 from dotenv import load_dotenv
 
-# Optionally set the path to the .env file (defaults to current directory if omitted)
 env_path = Path(__file__).parent / ".env"
-
-# Load the .env file into environment variables
-# load_dotenv returns True if the file was found and parsed
 load_dotenv(dotenv_path=env_path)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Portfolio RAG API", version="1.0")
+app = FastAPI(title="Portfolio RAG API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,27 +64,27 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Shared state — single RAGOrchestrator instance, swappable via /config
+# Shared state
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG = {
-    "gemini_api_key":  os.environ.get("GEMINI_API_KEY", ""),
-    "hf_model_name":   "gemini-embedding-001",
-    "chunk_size":      500,
-    "chunk_overlap":   50,
-    "dedup_threshold": None,
-    "min_tokens":      20,
-    "index_dir":       "./rag_index",
-    "cache_dir":       "./scraper_cache",
-    "follow_external": True,
-    "device":          "cpu",
-    "gemini_model":    "gemini-3-flash-preview",
-    "top_k":           6,
+    "gemini_api_key":   os.environ.get("GEMINI_API_KEY", ""),
+    "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "hf_model_name":    "gemini-embedding-001",
+    "chunk_size":       500,
+    "chunk_overlap":    50,
+    "dedup_threshold":  None,
+    "min_tokens":       20,
+    "index_dir":        "./rag_index",
+    "cache_dir":        "./scraper_cache",
+    "follow_external":  True,
+    "device":           "cpu",
+    "gemini_model":     "gemini-2.0-flash",
+    "top_k":            6,
 }
 
 _current_config: dict = dict(_DEFAULT_CONFIG)
-_rag: Optional[RAGOrchestrator] = None
-_gemini_rag: Optional[GeminiRAG] = None
+_rag:            Optional[RAGOrchestrator] = None
 
 
 def _get_rag() -> RAGOrchestrator:
@@ -98,11 +105,15 @@ def _get_rag() -> RAGOrchestrator:
     return _rag
 
 
-def _get_gemini_rag(system_prompt: Optional[str] = None) -> GeminiRAG:
+def _get_gemini_rag(
+    system_prompt: Optional[str] = None,
+    model_override: Optional[str] = None,
+) -> GeminiRAG:
     return GeminiRAG(
         db=_get_rag().db,
         gemini_api_key=_current_config["gemini_api_key"],
-        gemini_model=_current_config["gemini_model"],
+        anthropic_api_key=_current_config["anthropic_api_key"],
+        gemini_model=model_override or _current_config["gemini_model"],
         top_k=_current_config["top_k"],
         system_prompt=system_prompt,
     )
@@ -113,23 +124,24 @@ def _get_gemini_rag(system_prompt: Optional[str] = None) -> GeminiRAG:
 # ---------------------------------------------------------------------------
 
 class ConfigUpdate(BaseModel):
-    gemini_api_key:  Optional[str]   = None
-    hf_model_name:   Optional[str]   = None
-    chunk_size:      Optional[int]   = None
-    chunk_overlap:   Optional[int]   = None
-    dedup_threshold: Optional[float] = None
-    min_tokens:      Optional[int]   = None
-    index_dir:       Optional[str]   = None
-    cache_dir:       Optional[str]   = None
-    follow_external: Optional[bool]  = None
-    device:          Optional[str]   = None
-    gemini_model:    Optional[str]   = None
-    top_k:           Optional[int]   = None
+    gemini_api_key:   Optional[str]   = None
+    anthropic_api_key: Optional[str]  = None
+    hf_model_name:    Optional[str]   = None
+    chunk_size:       Optional[int]   = None
+    chunk_overlap:    Optional[int]   = None
+    dedup_threshold:  Optional[float] = None
+    min_tokens:       Optional[int]   = None
+    index_dir:        Optional[str]   = None
+    cache_dir:        Optional[str]   = None
+    follow_external:  Optional[bool]  = None
+    device:           Optional[str]   = None
+    gemini_model:     Optional[str]   = None
+    top_k:            Optional[int]   = None
 
 
 class IngestRequest(BaseModel):
-    url: str
-    rebuild: bool = False   # if True, rebuild index from cache without scraping
+    url:     str
+    rebuild: bool = False
 
 
 class QueryRequest(BaseModel):
@@ -139,6 +151,7 @@ class QueryRequest(BaseModel):
     doc_type_filter: Optional[str]  = None
     system_prompt:   Optional[str]  = None
     gemini_model:    Optional[str]  = None
+    session_id:      Optional[str]  = None
 
 
 # ---------------------------------------------------------------------------
@@ -154,25 +167,23 @@ def health():
 def get_config():
     safe = dict(_current_config)
     if safe.get("gemini_api_key"):
-        safe["gemini_api_key"] = "sk-…(set)"
+        safe["gemini_api_key"] = "***set***"
+    if safe.get("anthropic_api_key"):
+        safe["anthropic_api_key"] = "***set***"
     return safe
 
 
 @app.post("/config")
 def update_config(body: ConfigUpdate):
-    """Update pipeline config. Reinitialises RAG objects on next request."""
-    global _rag, _gemini_rag, _current_config
+    global _rag, _current_config
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     _current_config.update(updates)
-    # Force re-init on next use
     _rag = None
-    _gemini_rag = None
     return {"updated": list(updates.keys()), "config": get_config()}
 
 
 @app.post("/ingest")
 def ingest(body: IngestRequest):
-    """Scrape a portfolio URL and populate the vector index."""
     rag = _get_rag()
     if body.rebuild:
         chunks = rag.rebuild_index(body.url)
@@ -189,68 +200,34 @@ def stats():
     return _get_rag().stats()
 
 
-@app.post("/query")
-def query(body: QueryRequest):
-    """
-    Retrieve relevant chunks AND generate a Gemini answer.
-    Returns chunks + answer + sources in one response.
-    """
-    rag = _get_rag()
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
 
-    # Override model per-request if provided
-    if body.gemini_model:
-        _current_config["gemini_model"] = body.gemini_model
+@app.get("/sessions")
+def list_sessions():
+    g = _get_gemini_rag()
+    return {"sessions": g.list_sessions()}
 
-    g = _get_gemini_rag(system_prompt=body.system_prompt)
 
-    # Retrieve chunks for display
-    chunks = rag.query(
-        question=body.question,
-        top_k=body.top_k,
-        section_filter=body.section_filter,
-        doc_type_filter=body.doc_type_filter,
-    )
+@app.delete("/sessions/{session_id}")
+def clear_session(session_id: str):
+    g = _get_gemini_rag()
+    g.clear_session(session_id)
+    return {"cleared": session_id}
 
-    # Generate answer
-    result = g.answer(
-        question=body.question,
-        top_k=body.top_k,
-        section_filter=body.section_filter,
-        doc_type_filter=body.doc_type_filter,
-    )
 
-    return {
-        "question": body.question,
-        "answer":   result.answer,
-        "tokens_used": result.total_tokens_used,
-        "chunks": [
-            {
-                "rank":         i + 1,
-                "score":        r["score"],
-                "doc_index":    r["doc_index"],
-                "doc_title":    r["doc_title"],
-                "section":      r["section"],
-                "doc_type":     r["doc_type"],
-                "doc_url":      r["doc_url"],
-                "chunk_index":  r["chunk_index"],
-                "raw_content":  r["raw_content"],
-                "full_text":    r["text"],
-            }
-            for i, r in enumerate(chunks)
-        ],
-        "sources": [
-            {
-                "doc_index": s.doc_index,
-                "doc_title": s.doc_title,
-                "section":   s.section,
-                "doc_type":  s.doc_type,
-                "doc_url":   s.doc_url,
-                "score":     s.score,
-            }
-            for s in result.sources
-        ],
-    }
+@app.delete("/sessions")
+def clear_all_sessions():
+    g = _get_gemini_rag()
+    for sid in g.list_sessions():
+        g.clear_session(sid)
+    return {"cleared": "all"}
 
+
+# ---------------------------------------------------------------------------
+# Query — streaming SSE (main endpoint used by frontend)
+# ---------------------------------------------------------------------------
 
 @app.get("/query/stream")
 async def query_stream(
@@ -260,24 +237,25 @@ async def query_stream(
     doc_type_filter: Optional[str] = None,
     system_prompt:   Optional[str] = None,
     gemini_model:    Optional[str] = None,
+    session_id:      Optional[str] = None,
 ):
     """
-    Server-Sent Events streaming endpoint.
+    SSE streaming endpoint.
     Emits:
-      event: chunk   → each retrieved chunk as JSON (sent first, before generation)
-      event: token   → each Gemini text token
-      event: done    → final metadata (sources, tokens_used)
-      event: error   → on failure
+      event: chunk   — each retrieved chunk (before generation)
+      event: token   — each LLM text token
+      event: done    — final metadata (sources, tokens_used)
+      event: error   — on failure
     """
     rag = _get_rag()
-    if gemini_model:
-        _current_config["gemini_model"] = gemini_model
-
-    g = _get_gemini_rag(system_prompt=system_prompt)
+    g   = _get_gemini_rag(
+        system_prompt=system_prompt,
+        model_override=gemini_model,
+    )
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
-            # 1. Send retrieved chunks immediately
+            # 1. Send retrieved chunks
             chunks = rag.query(
                 question=question,
                 top_k=top_k,
@@ -299,12 +277,13 @@ async def query_stream(
                 yield f"event: chunk\ndata: {payload}\n\n"
                 await asyncio.sleep(0)
 
-            # 2. Stream Gemini tokens
-            gen = g.stream_answer(
+            # 2. Stream tokens
+            gen          = g.stream_answer(
                 question=question,
                 top_k=top_k,
                 section_filter=section_filter,
                 doc_type_filter=doc_type_filter,
+                session_id=session_id,
             )
             final_answer = None
             try:
@@ -341,15 +320,78 @@ async def query_stream(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control":    "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
 
 
+# ---------------------------------------------------------------------------
+# Query — single-shot (non-streaming)
+# ---------------------------------------------------------------------------
+
+@app.post("/query")
+def query(body: QueryRequest):
+    rag = _get_rag()
+    g   = _get_gemini_rag(
+        system_prompt=body.system_prompt,
+        model_override=body.gemini_model,
+    )
+
+    chunks = rag.query(
+        question=body.question,
+        top_k=body.top_k,
+        section_filter=body.section_filter,
+        doc_type_filter=body.doc_type_filter,
+    )
+
+    result = g.answer(
+        question=body.question,
+        top_k=body.top_k,
+        section_filter=body.section_filter,
+        doc_type_filter=body.doc_type_filter,
+        session_id=body.session_id,
+    )
+
+    return {
+        "question":    body.question,
+        "answer":      result.answer,
+        "tokens_used": result.total_tokens_used,
+        "chunks": [
+            {
+                "rank":         i + 1,
+                "score":        r["score"],
+                "doc_index":    r["doc_index"],
+                "doc_title":    r["doc_title"],
+                "section":      r["section"],
+                "doc_type":     r["doc_type"],
+                "doc_url":      r["doc_url"],
+                "chunk_index":  r["chunk_index"],
+                "raw_content":  r["raw_content"],
+                "full_text":    r["text"],
+            }
+            for i, r in enumerate(chunks)
+        ],
+        "sources": [
+            {
+                "doc_index": s.doc_index,
+                "doc_title": s.doc_title,
+                "section":   s.section,
+                "doc_type":  s.doc_type,
+                "doc_url":   s.doc_url,
+                "score":     s.score,
+            }
+            for s in result.sources
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Danger zone
+# ---------------------------------------------------------------------------
+
 @app.delete("/cache")
 def clear_cache():
-    """Delete all cached pages and videos."""
     import shutil
     cache_dir = _current_config.get("cache_dir", "./scraper_cache")
     shutil.rmtree(cache_dir, ignore_errors=True)
@@ -358,6 +400,5 @@ def clear_cache():
 
 @app.delete("/index")
 def clear_index():
-    """Wipe the FAISS vector index (keeps scraper cache)."""
     _get_rag().db.clear()
     return {"cleared": "faiss_index"}
