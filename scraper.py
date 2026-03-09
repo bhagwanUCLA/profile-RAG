@@ -51,7 +51,7 @@ class ScrapedDocument:
 # ---------------------------------------------------------------------------
 
 _YT_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|embed/)|youtu\.be/)([\w\-]{6,})",
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([\w\-]{6,})",
     flags=re.I,
 )
 
@@ -139,21 +139,30 @@ class ScraperCache:
         except Exception as exc:
             logger.warning("cache write error (page) %s: %s", url, exc)
 
-    def get_video(self, url: str) -> Optional[str]:
+    def get_video(self, url: str) -> Optional[dict]:
+        """Returns {"title": ..., "summary": ...} or None."""
         path = self._videos_dir / f"{_url_hash(url)}.json"
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))["summary"]
+            data = json.loads(path.read_text(encoding="utf-8"))
+            # Support old format (plain string summary) and new format (dict)
+            if isinstance(data, str):
+                return {"title": "", "summary": data}
+            return data
         except Exception as exc:
             logger.warning("cache read error (video) %s: %s", url, exc)
             return None
 
-    def set_video(self, url: str, summary: str) -> None:
+    def set_video(self, url: str, title: str, summary: str) -> None:
         path = self._videos_dir / f"{_url_hash(url)}.json"
         try:
-            path.write_text(json.dumps({"url": url, "summary": summary, "cached_at": _now_iso()}, ensure_ascii=False),
-                            encoding="utf-8")
+            path.write_text(json.dumps({
+                "url": url,
+                "title": title,
+                "summary": summary,
+                "cached_at": _now_iso(),
+            }, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             logger.warning("cache write error (video) %s: %s", url, exc)
 
@@ -301,6 +310,22 @@ def _page_title(soup: BeautifulSoup, fallback: str) -> str:
     return fallback
 
 
+def _split_gemini_title(text: str, fallback: str) -> tuple[str, str]:
+    """
+    Parse a TITLE: line that Gemini is instructed to put on line 1.
+
+    Returns (title, content_without_title_line).
+    If no TITLE: line is found, returns (fallback, original_text).
+    """
+    for i, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped.upper().startswith("TITLE:"):
+            title = stripped[6:].strip()
+            remaining = "\n".join(text.splitlines()[i + 1:]).strip()
+            return (title or fallback), remaining
+    return fallback, text
+
+
 # ---------------------------------------------------------------------------
 # PDF helpers (local stages kept as optional fallbacks)
 # ---------------------------------------------------------------------------
@@ -385,7 +410,6 @@ class PortfolioScraper:
 
         self._session = requests.Session()
         self._session.headers.update(_DEFAULT_HEADERS)
-        # Gemini client initialised only when key provided
         try:
             self._gemini = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
         except Exception:
@@ -455,9 +479,7 @@ class PortfolioScraper:
                 if _is_youtube(ext_url):
                     docs.extend(self._summarise_video(ext_url, section))
                 else:
-                    doc = self._scrape_external_page(ext_url, section)
-                    if doc:
-                        docs.append(doc)
+                    docs.extend(self._scrape_external_page(ext_url, section))
 
         logger.info("scrape_portfolio done: %d documents", len(docs))
         return docs
@@ -487,10 +509,12 @@ class PortfolioScraper:
             if _is_youtube(link):
                 docs.extend(self._summarise_video(link, section_name))
             else:
-                doc = (self._scrape_external_page(link, section_name)
-                       if is_ext else self._scrape_internal_page(link, section_name))
-                if doc:
-                    docs.append(doc)
+                if is_ext:
+                    docs.extend(self._scrape_external_page(link, section_name))
+                else:
+                    doc = self._scrape_internal_page(link, section_name)
+                    if doc:
+                        docs.append(doc)
         return docs
 
     def summarise_videos(self, youtube_urls: list[str], section: str = "video") -> list[ScrapedDocument]:
@@ -582,52 +606,70 @@ class PortfolioScraper:
         content = _extract_plain_text(soup)
         return self._make_doc(title=_page_title(soup, url), section=section, url=url, content=content, doc_type="text") if content else None
 
-    def _scrape_external_page(self, url: str, section: str) -> Optional[ScrapedDocument]:
-        # Cache hit path
+    def _scrape_external_page(self, url: str, section: str) -> list[ScrapedDocument]:
+        """
+        Fetch and process an external URL. Returns a list (may be empty).
+
+        Handles YouTube redirect detection: if the final URL after following
+        redirects turns out to be a YouTube URL, delegates to _summarise_video.
+        """
+        # ── Cache hit path ────────────────────────────────────────────
         if self.cache:
             cached = self.cache.get_page(url)
             if cached:
-                html = cached["html"]
                 final_url = cached.get("final_url", url)
+                # Check if cached page was actually a YouTube redirect
+                if _is_youtube(final_url):
+                    return self._summarise_video(final_url, section)
                 ct = cached.get("content_type", "")
                 if _is_pdf_ct(ct) or _is_office_ct(ct):
-                    content = BeautifulSoup(html, "html.parser").get_text()
+                    content = BeautifulSoup(cached["html"], "html.parser").get_text()
                 else:
-                    content = _extract_article_text(html, final_url)
+                    content = _extract_article_text(cached["html"], final_url)
                     if not content:
-                        content = _extract_plain_text(BeautifulSoup(html, "html.parser"))
+                        content = _extract_plain_text(BeautifulSoup(cached["html"], "html.parser"))
                 if not content:
-                    return None
-                soup = BeautifulSoup(html, "html.parser")
-                return self._make_doc(title=_page_title(soup, url), section=section, url=url, content=content, doc_type="text")
+                    return []
+                soup = BeautifulSoup(cached["html"], "html.parser")
+                return [self._make_doc(title=_page_title(soup, url), section=section,
+                                       url=url, content=content, doc_type="text")]
 
-        # Live fetch
+        # ── Live fetch ────────────────────────────────────────────────
         resp = self._do_get(url)
         if resp is None:
-            return None
+            return []
 
         final_url = resp.url or url
         ct = resp.headers.get("Content-Type", "")
 
-        # Document / binary files (Gemini-first)
+        # ── YouTube redirect detection ────────────────────────────────
+        # The raw URL may be an opaque redirect; check the final destination.
+        if _is_youtube(final_url):
+            logger.info("  [YouTube redirect] %s -> %s", url, final_url)
+            self._visited.add(final_url)
+            return self._summarise_video(final_url, section)
+
+        # ── Binary / document files (Gemini-first) ────────────────────
         if (_is_pdf_ct(ct) or _is_pdf_url(final_url) or _is_pdf_url(url)
                 or _is_office_ct(ct) or _is_office_url(final_url) or _is_office_url(url)):
-            logger.info("  [Gemini file extraction] treating as document: %s", final_url)
+            logger.info("  [Gemini file extraction] %s", final_url)
             filename = final_url.split("/")[-1].split("?")[0] if "/" in final_url else None
-            # Use the same Gemini-backed file extractor for PDFs & office files
-            extracted = self._file_stage3_gemini(resp.content, final_url, filename=filename, mime_hint=ct)
+            title, extracted = self._file_stage3_gemini(
+                resp.content, final_url, filename=filename, mime_hint=ct,
+                fallback_title=filename or final_url.split("/")[-1],
+            )
             if not extracted:
                 logger.warning("Document extraction returned empty for %s", final_url)
-                return None
-            wrapper = f"<html><head><title>FILE: {final_url}</title></head><body><pre>{extracted}</pre></body></html>"
+                return []
+            wrapper = f"<html><head><title>{title}</title></head><body><pre>{extracted}</pre></body></html>"
             if self.cache:
                 self.cache.set_page(url, final_url, wrapper, ct or "application/octet-stream")
                 if final_url != url:
                     self.cache.set_page(final_url, final_url, wrapper, ct or "application/octet-stream")
             self._visited.add(final_url)
-            return self._make_doc(title=f"File: {filename or final_url.split('/')[-1]}", section=section, url=url, content=extracted, doc_type="text")
+            return [self._make_doc(title=title, section=section, url=url, content=extracted, doc_type="text")]
 
-        # HTML path
+        # ── HTML path ─────────────────────────────────────────────────
         html = resp.text
         if self.cache:
             self.cache.set_page(url, final_url, html, ct or "text/html")
@@ -639,35 +681,46 @@ class PortfolioScraper:
         if not content:
             content = _extract_plain_text(BeautifulSoup(html, "html.parser"))
         if not content:
-            return None
+            return []
         soup = BeautifulSoup(html, "html.parser")
-        return self._make_doc(title=_page_title(soup, url), section=section, url=url, content=content, doc_type="text")
+        return [self._make_doc(title=_page_title(soup, url), section=section,
+                               url=url, content=content, doc_type="text")]
 
     # ------------------------------------------------------------------
-    # Gemini file extraction (upload -> generate_content -> delete)
+    # Gemini file extraction  (upload → generate_content → delete)
     # ------------------------------------------------------------------
 
-    def _file_stage3_gemini(self, file_bytes: bytes, source_url: str, filename: Optional[str] = None, mime_hint: Optional[str] = None) -> str:
+    def _file_stage3_gemini(
+        self,
+        file_bytes: bytes,
+        source_url: str,
+        filename: Optional[str] = None,
+        mime_hint: Optional[str] = None,
+        fallback_title: str = "",
+    ) -> tuple[str, str]:
         """
-        Upload a single file to Gemini Files API, ask the model to extract content
-        (spreadsheet -> CSV/markdown per sheet; doc -> full text; slides -> slides),
-        then delete the uploaded file (best-effort). Does NOT list files.
+        Upload a file to Gemini Files API, extract structured content, delete it.
+
+        Every prompt instructs Gemini to output:
+
+            TITLE: <document title>
+
+            <rest of extracted content>
+
+        Returns (title, content).  Both are empty strings on failure.
         """
         if not self._gemini:
             logger.warning("Gemini client not configured; cannot extract file: %s", source_url)
-            return ""
+            return fallback_title, ""
 
         tmp_path: Optional[str] = None
         uploaded = None
         try:
-            # determine suffix from filename or source_url
             suffix = ""
             if filename and "." in filename:
                 suffix = "." + filename.split(".")[-1]
             elif source_url and "." in source_url.split("/")[-1]:
                 suffix = "." + source_url.split("/")[-1].split("?")[0].split(".")[-1]
-                if suffix and not suffix.startswith("."):
-                    suffix = "." + suffix
 
             fd, tmp_path = tempfile.mkstemp(suffix=suffix or "")
             os.close(fd)
@@ -677,45 +730,59 @@ class PortfolioScraper:
             logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
             uploaded = self._gemini.files.upload(file=tmp_path)
 
-            # Choose prompt and mime_type hint based on extension/mime
             ext = (filename or source_url or "").lower().split("?")[0]
-            prompt = (
-                "Extract the file's textual content in a plain, machine-friendly form. "
-                "If it's a spreadsheet, produce a CSV or markdown table per sheet. "
-                "If it's a document, preserve headings, paragraphs, lists and tables. "
-                "If it's a presentation, list slide-by-slide content. "
-                "Return the raw extracted content only (no commentary)."
-            )
             mime_type = mime_hint or ""
 
+            # ── Choose prompt by file type ────────────────────────────
             if ext.endswith(".pdf") or (mime_hint and "pdf" in mime_hint):
-                prompt = (
-                    "Extract ALL text from this PDF verbatim. Preserve headings, paragraphs, tables and bullet lists. "
-                    "Use LaTeX for mathematical formulas. Do not summarise or omit any content."
-                )
                 mime_type = "application/pdf"
-            elif ext.endswith((".xlsx", ".xls", ".xlsm", ".xlsb", ".csv")) or (mime_hint and "spreadsheet" in mime_hint) or ext.endswith(".ods"):
                 prompt = (
-                    "Extract the spreadsheet contents. For each sheet, produce a CSV block or a markdown table with the sheet name as a header. "
-                    "Preserve column headers, cell text and numbers. Indicate empty cells as empty. Return only the data and sheet names."
+                    "You are extracting content from a PDF document.\n\n"
+                    "Output format (follow exactly):\n"
+                    "TITLE: <the document's actual title — e.g. paper name, report name, book chapter>\n\n"
+                    "<full extracted text below — preserve headings, paragraphs, tables, bullet lists; "
+                    "use LaTeX for mathematical formulas; do not summarise or omit any content>"
+                )
+            elif (ext.endswith((".xlsx", ".xls", ".xlsm", ".xlsb", ".csv"))
+                  or (mime_hint and "spreadsheet" in mime_hint)
+                  or ext.endswith(".ods")):
+                prompt = (
+                    "You are extracting content from a spreadsheet.\n\n"
+                    "Output format (follow exactly):\n"
+                    "TITLE: <the spreadsheet's name or main topic>\n\n"
+                    "<for each sheet, output a markdown table or CSV block with the sheet name as a heading; "
+                    "preserve column headers, cell text and numbers; indicate empty cells as empty>"
                 )
             elif ext.endswith((".docx", ".doc", ".odt")) or (mime_hint and "word" in mime_hint):
                 prompt = (
-                    "Extract the full text from this document. Preserve headings, paragraphs, lists and tables. "
-                    "Return plain text with headings clearly marked. Do not summarise."
+                    "You are extracting content from a Word document.\n\n"
+                    "Output format (follow exactly):\n"
+                    "TITLE: <the document's actual title or subject>\n\n"
+                    "<full text below — preserve headings, paragraphs, lists and tables; do not summarise>"
                 )
             elif ext.endswith((".pptx", ".ppt")) or (mime_hint and "presentation" in mime_hint):
                 prompt = (
-                    "Extract slide-by-slide content. For each slide, list the slide number, title (if any) and bullet points / text blocks. "
-                    "Return in plain text or markdown with slide separators."
+                    "You are extracting content from a presentation.\n\n"
+                    "Output format (follow exactly):\n"
+                    "TITLE: <the presentation's title>\n\n"
+                    "<slide-by-slide content: for each slide, output the slide number, title and bullet points / text; "
+                    "use slide separators>"
+                )
+            else:
+                prompt = (
+                    "You are extracting content from a document.\n\n"
+                    "Output format (follow exactly):\n"
+                    "TITLE: <the document's actual title or main topic>\n\n"
+                    "<full extracted content below — preserve headings, paragraphs, lists and tables; "
+                    "do not summarise>"
                 )
 
-            text = ""
+            raw_text = ""
             try:
                 contents = types.Content(parts=[
                     types.Part(file_data=types.FileData(
                         file_uri=getattr(uploaded, "uri", getattr(uploaded, "name", None)),
-                        mime_type=mime_type or None
+                        mime_type=mime_type or None,
                     )),
                     types.Part(text=prompt),
                 ])
@@ -723,31 +790,34 @@ class PortfolioScraper:
                     model=self.gemini_model,
                     contents=contents,
                 )
-                text = getattr(response, "text", "") or ""
+                raw_text = getattr(response, "text", "") or ""
             except Exception as exc:
-                logger.debug("generate_content(parts=...) failed; trying fallback form: %s", exc)
+                logger.debug("generate_content(parts=...) failed; trying fallback: %s", exc)
                 try:
                     response = self._gemini.models.generate_content(
                         model=self.gemini_model,
                         contents=[uploaded, prompt],
                     )
-                    text = getattr(response, "text", "") or ""
+                    raw_text = getattr(response, "text", "") or ""
                 except Exception as exc2:
                     logger.error("Gemini generate_content failed for %s: %s", source_url, exc2)
-                    text = ""
 
-            # Attempt to delete uploaded file from Gemini storage (best-effort)
+            # Best-effort delete
             try:
                 if getattr(uploaded, "name", None) and hasattr(self._gemini.files, "delete"):
                     self._gemini.files.delete(name=uploaded.name)
             except Exception:
                 pass
 
-            return _clean_text(text)
+            if not raw_text:
+                return fallback_title, ""
+
+            title, content = _split_gemini_title(raw_text, fallback=fallback_title)
+            return title, _clean_text(content)
 
         except Exception as exc:
             logger.error("Gemini file extraction failed [%s]: %s", source_url, exc)
-            return ""
+            return fallback_title, ""
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -760,22 +830,35 @@ class PortfolioScraper:
     # ------------------------------------------------------------------
 
     def _summarise_video(self, yt_url: str, section: str) -> list[ScrapedDocument]:
+        # ── Cache hit ─────────────────────────────────────────────────
         if self.cache:
             cached = self.cache.get_video(yt_url)
             if cached is not None:
                 logger.info("  [video cache HIT]  %s", yt_url)
-                return [self._make_doc(title=self._extract_video_title(cached, yt_url), section=section, url=yt_url, content=cached, doc_type="video_summary")]
+                raw_text = cached.get("summary", "")
+                title    = cached.get("title") or self._fallback_video_title(raw_text, yt_url)
+                # Re-parse to strip TITLE: line from content (handles both old/new cache format)
+                _, content = _split_gemini_title(raw_text, fallback="")
+                content = _clean_text(content) or raw_text
+                return [self._make_doc(title=title, section=section, url=yt_url,
+                                       content=content, doc_type="video_summary")]
 
         if not self._gemini:
             logger.warning("Gemini client not configured; skipping video: %s", yt_url)
             return []
 
         logger.info("  [video Gemini call] %s", yt_url)
+
         prompt = (
-            "Please summarise the video thoroughly and provide a full transcript.\n\n"
-            "## Summarisation\n<detailed summary here>\n\n"
-            "## Transcript\n<full transcript here>"
+            "You are summarising and transcribing a YouTube video.\n\n"
+            "Output format (follow exactly — no deviations):\n"
+            "TITLE: <the video's actual title>\n\n"
+            "## Summary\n"
+            "<thorough summary of the video's content, key arguments and conclusions>\n\n"
+            "## Transcript\n"
+            "<full verbatim or near-verbatim transcript>"
         )
+
         try:
             response = self._gemini.models.generate_content(
                 model=self.gemini_model,
@@ -784,10 +867,14 @@ class PortfolioScraper:
                     types.Part(text=prompt),
                 ])
             )
-            content = response.text or ""
+            raw_text = response.text or ""
+            title, content = _split_gemini_title(raw_text, fallback=f"Video – {yt_url}")
+            content = _clean_text(content)
             if self.cache:
-                self.cache.set_video(yt_url, content)
-            return [self._make_doc(title=self._extract_video_title(content, yt_url), section=section, url=yt_url, content=content, doc_type="video_summary")]
+                # Store raw_text so title can be re-parsed on cache hit
+                self.cache.set_video(yt_url, title=title, summary=raw_text)
+            return [self._make_doc(title=title, section=section, url=yt_url,
+                                   content=content, doc_type="video_summary")]
         except Exception as exc:
             logger.error("  Gemini video failed [%s]: %s", yt_url, exc)
             return []
@@ -834,11 +921,14 @@ class PortfolioScraper:
                 logger.info("  [Gemini file] detected document URL/content-type: %s (%s)", final_url, ct)
                 try:
                     filename = final_url.split("/")[-1].split("?")[0]
-                    extracted = self._file_stage3_gemini(resp.content, final_url, filename=filename, mime_hint=ct)
+                    title, extracted = self._file_stage3_gemini(
+                        resp.content, final_url, filename=filename, mime_hint=ct,
+                        fallback_title=filename,
+                    )
                     if not extracted:
                         logger.warning("Gemini returned empty for %s", final_url)
                         return None, final_url
-                    wrapper = f"<html><head><title>FILE: {final_url}</title></head><body><pre>{extracted}</pre></body></html>"
+                    wrapper = f"<html><head><title>{title}</title></head><body><pre>{extracted}</pre></body></html>"
                     if self.cache:
                         self.cache.set_page(url, final_url, wrapper, ct or "application/octet-stream")
                         if final_url != url:
@@ -884,16 +974,19 @@ class PortfolioScraper:
     # Utilities
     # ------------------------------------------------------------------
 
-    def _make_doc(self, title: str, section: str, url: str, content: str, doc_type: str, extra: Optional[dict] = None) -> ScrapedDocument:
+    def _make_doc(self, title: str, section: str, url: str, content: str,
+                  doc_type: str, extra: Optional[dict] = None) -> ScrapedDocument:
         self._doc_counter += 1
-        return ScrapedDocument(index=self._doc_counter, title=title, section=section, url=url, content=content, doc_type=doc_type, extra=extra or {})
+        return ScrapedDocument(index=self._doc_counter, title=title, section=section,
+                               url=url, content=content, doc_type=doc_type, extra=extra or {})
 
     def _make_index_doc(self, soup: BeautifulSoup, url: str, section: str, title: str) -> ScrapedDocument:
-        """Index doc contains text + links (useful for site index pages)."""
-        return self._make_doc(title=title, section=section, url=url, content=_extract_text_with_links(soup, url), doc_type="index")
+        return self._make_doc(title=title, section=section, url=url,
+                              content=_extract_text_with_links(soup, url), doc_type="index")
 
     @staticmethod
-    def _extract_video_title(content: str, fallback_url: str) -> str:
+    def _fallback_video_title(content: str, fallback_url: str) -> str:
+        """Last-resort title extraction from content when TITLE: line is missing."""
         for line in content.splitlines():
             line = line.strip().lstrip("#").strip()
             if line and len(line) < 200:
@@ -903,4 +996,3 @@ class PortfolioScraper:
     def _reset_session(self) -> None:
         self._doc_counter = 0
         self._visited = set()
-

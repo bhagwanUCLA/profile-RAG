@@ -1,33 +1,28 @@
 """
 rag_query.py
 ------------
-GeminiRAG — end-to-end RAG query class with conversational chat support.
+ClaudeRAG — end-to-end RAG query class using Anthropic Claude with tool-use.
 
-Supports:
-  - Google Gemini models  (gemini-2.0-flash, gemini-2.5-flash-*, etc.)
-  - Anthropic Claude models (claude-sonnet-4-*, claude-opus-4-*, etc.)
-
-Conversation history is maintained per session_id so the LLM
-remembers previous turns within the same browser session.
+RAG retrieval is exposed as a `search_portfolio` tool that Claude calls
+when it needs information, rather than always pre-retrieving.
 
 Two query modes
 ---------------
-answer(question)          → single-shot answer
-stream_answer(question)   → yields text tokens as they arrive (streaming)
+answer(question)        → single-shot answer
+stream_answer(question) → yields text tokens as they arrive (streaming)
 
-Both accept an optional session_id (str).  Pass the same id across calls
-to maintain a conversation.  Omit / pass None for a stateless one-shot query.
+Both accept an optional session_id (str). Pass the same id across calls
+to maintain a conversation. Omit / pass None for a stateless one-shot query.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import textwrap
 from dataclasses import dataclass, field
 from typing import Generator, Optional
-
-from google import genai
-from google.genai import types as gtypes
 
 from database import FAISSDatabase
 
@@ -58,23 +53,81 @@ class GeminiAnswer:
 
 
 # ---------------------------------------------------------------------------
-# Default system prompt
+# System prompt
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
     You are a helpful assistant answering questions about a person's portfolio.
-    You are given a set of retrieved context chunks from a vector database.
-    Each chunk starts with a metadata header showing its source document index,
-    title, section, type, and URL.
+    You have access to a `search_portfolio` tool that searches a vector database
+    of portfolio content.
 
     Rules:
-    - Answer ONLY from the provided context chunks.
-    - If the answer is not present in the context, say so clearly.
-    - When you reference information, cite the source using its [index] number.
+    - Use the search_portfolio tool whenever you need information about the person.
+    - For purely conversational messages (greetings, follow-ups on what you just said,
+      clarification requests that don't need new facts) you may answer directly
+      without calling the tool.
+    - When you use the tool, answer ONLY from the returned chunks.
+    - If the tool returns no relevant information, say so clearly.
+    - When you reference information, cite the source using its [index] number shown
+      in the chunk headers.
     - Be concise but complete.
     - Remember the full conversation history and refer back to it when relevant.
-    - Do not fabricate any information not present in the context.
+    - Do not fabricate any information not present in the retrieved chunks.
 """)
+
+
+# ---------------------------------------------------------------------------
+# Claude tool definition
+# ---------------------------------------------------------------------------
+
+_SEARCH_TOOL = {
+    "name": "search_portfolio",
+    "description": (
+        "Search the portfolio vector database for relevant information about the person. "
+        "Use this tool whenever you need to look up facts about their background, "
+        "research, publications, employment, education, advising, teaching, opinions, "
+        "media appearances, or any other portfolio content. "
+        "Returns the most relevant text chunks from the database ranked by similarity. "
+        "You may call it more than once per turn with different queries if needed. "
+        "Do NOT call it for greetings or purely conversational messages."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Natural language search query describing what information you need. "
+                    "Be specific — e.g. 'PhD education University of Chicago' rather than 'education'."
+                ),
+            },
+            "section_filter": {
+                "type": "string",
+                "description": (
+                    "Optional: restrict results to a specific portfolio section. "
+                    "Valid values: biography, video, opinion, employment, education, advisor, "
+                    "cases, research, associate_editor, contact, executive_teaching, "
+                    "research_in_progress, working_papers, fame, general. "
+                    "Omit to search all sections."
+                ),
+            },
+            "doc_type_filter": {
+                "type": "string",
+                "description": (
+                    "Optional: restrict by document type. "
+                    "Valid values: index, text, video_summary. Omit to search all types."
+                ),
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of chunks to return (1-20). Defaults to 6.",
+                "minimum": 1,
+                "maximum": 20,
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -88,16 +141,6 @@ def _build_context_block(results: list[dict]) -> str:
         lines.append(r["text"])
         lines.append("")
     return "\n".join(lines)
-
-
-def _build_user_message(question: str, context: str) -> str:
-    return (
-        f"## Retrieved Context\n\n"
-        f"{context}\n"
-        f"---\n\n"
-        f"## Question\n\n"
-        f"{question}"
-    )
 
 
 def _extract_sources(results: list[dict]) -> list[Source]:
@@ -119,21 +162,28 @@ def _extract_sources(results: list[dict]) -> list[Source]:
     return sources
 
 
-def _is_claude_model(model: str) -> bool:
-    return model.startswith("claude")
+def _blocks_to_dicts(content_blocks) -> list[dict]:
+    """Convert SDK ContentBlock objects to plain serialisable dicts."""
+    out = []
+    for b in content_blocks:
+        t = getattr(b, "type", None)
+        if t == "text":
+            out.append({"type": "text", "text": b.text})
+        elif t == "tool_use":
+            out.append({
+                "type":  "tool_use",
+                "id":    b.id,
+                "name":  b.name,
+                "input": dict(b.input),
+            })
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Gemini chat session store  (session_id → google.genai Chat object)
+# Session store
 # ---------------------------------------------------------------------------
 
-_gemini_sessions: dict[str, object] = {}   # session_id → genai Chat
-
-# ---------------------------------------------------------------------------
-# Claude conversation history store  (session_id → list of message dicts)
-# ---------------------------------------------------------------------------
-
-_claude_histories: dict[str, list[dict]] = {}   # session_id → [{role, content}]
+_claude_histories: dict[str, list[dict]] = {}  # session_id → [{role, content}]
 
 
 # ---------------------------------------------------------------------------
@@ -142,95 +192,89 @@ _claude_histories: dict[str, list[dict]] = {}   # session_id → [{role, content
 
 class GeminiRAG:
     """
-    Retrieval-augmented generation using FAISSDatabase + Google Gemini or Anthropic Claude.
+    Retrieval-augmented generation using FAISSDatabase + Anthropic Claude tool-use.
+
+    The class is still named GeminiRAG for API compatibility with server.py.
 
     Parameters
     ----------
-    db              : FAISSDatabase — populated vector store.
-    gemini_api_key  : Google Gemini API key.
-    anthropic_api_key : Anthropic API key (required for Claude models).
-    gemini_model    : Model name.  Gemini or Claude.
-    top_k           : Number of chunks to retrieve per query.
-    system_prompt   : Override the default system prompt if needed.
+    db                : FAISSDatabase — populated vector store.
+    gemini_api_key    : Unused (kept for API compatibility with server.py).
+    anthropic_api_key : Anthropic API key.
+    gemini_model      : Claude model name (e.g. 'claude-sonnet-4-6').
+    top_k             : Default number of chunks to retrieve per tool call.
+    system_prompt     : Override the default system prompt if needed.
     """
 
     def __init__(
         self,
         db: FAISSDatabase,
-        gemini_api_key: str,
         anthropic_api_key: str = "",
-        gemini_model: str = "gemini-2.0-flash",
+        gemini_model: str = "claude-sonnet-4-6",
         top_k: int = 6,
         system_prompt: Optional[str] = None,
     ) -> None:
-        self.db               = db
-        self.gemini_model     = gemini_model
-        self.top_k            = top_k
-        self._system          = system_prompt or _SYSTEM_PROMPT
-        self._gemini_client   = genai.Client(api_key=gemini_api_key)
-        self._anthropic_key   = anthropic_api_key
+        self.db             = db
+        self.model          = gemini_model
+        self.top_k          = top_k
+        self._system        = system_prompt or _SYSTEM_PROMPT
+        # Key resolution: constructor arg → env var
+        self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
     def clear_session(self, session_id: str) -> None:
-        """Wipe conversation history for a session."""
-        _gemini_sessions.pop(session_id, None)
         _claude_histories.pop(session_id, None)
 
     def list_sessions(self) -> list[str]:
-        return list(set(list(_gemini_sessions.keys()) + list(_claude_histories.keys())))
+        return list(_claude_histories.keys())
 
     # ------------------------------------------------------------------
-    # Gemini chat helpers
+    # History helpers
     # ------------------------------------------------------------------
 
-    def _get_gemini_chat(self, session_id: Optional[str]):
-        """Return existing Gemini chat for the session, or create a new one."""
-        if not session_id:
-            # Stateless — new chat every time
-            return self._gemini_client.chats.create(
-                model=self.gemini_model,
-                config=gtypes.GenerateContentConfig(
-                    system_instruction=self._system,
-                    temperature=0.2,
-                    max_output_tokens=2048,
-                ),
-            )
-        if session_id not in _gemini_sessions:
-            _gemini_sessions[session_id] = self._gemini_client.chats.create(
-                model=self.gemini_model,
-                config=gtypes.GenerateContentConfig(
-                    system_instruction=self._system,
-                    temperature=0.2,
-                    max_output_tokens=2048,
-                ),
-            )
-        return _gemini_sessions[session_id]
-
-    # ------------------------------------------------------------------
-    # Claude history helpers
-    # ------------------------------------------------------------------
-
-    def _get_claude_history(self, session_id: Optional[str]) -> list[dict]:
+    def _get_history(self, session_id: Optional[str]) -> list[dict]:
         if not session_id:
             return []
         if session_id not in _claude_histories:
             _claude_histories[session_id] = []
         return _claude_histories[session_id]
 
-    def _append_claude_turn(
+    def _save_turn(
         self,
         session_id: Optional[str],
-        user_msg: str,
-        assistant_msg: str,
+        question: str,
+        assistant_content: list[dict],
     ) -> None:
         if not session_id:
             return
-        history = self._get_claude_history(session_id)
-        history.append({"role": "user",      "content": user_msg})
-        history.append({"role": "assistant", "content": assistant_msg})
+        history = self._get_history(session_id)
+        history.append({"role": "user",      "content": question})
+        history.append({"role": "assistant", "content": assistant_content})
+
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
+
+    def _run_search_tool(
+        self,
+        tool_input: dict,
+        default_top_k: int,
+        default_section: Optional[str],
+        default_doc_type: Optional[str],
+    ) -> tuple[str, list[Source]]:
+        query    = tool_input.get("query", "")
+        top_k    = int(tool_input.get("top_k", default_top_k))
+        section  = tool_input.get("section_filter") or default_section
+        doc_type = tool_input.get("doc_type_filter") or default_doc_type
+
+        results = self._retrieve(query, top_k, section, doc_type)
+        if not results:
+            return "No relevant chunks found for this query.", []
+
+        return _build_context_block(results), _extract_sources(results)
 
     # ------------------------------------------------------------------
     # Public API — answer()
@@ -244,73 +288,73 @@ class GeminiRAG:
         doc_type_filter: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> GeminiAnswer:
-        k = top_k or self.top_k
-        results = self._retrieve(question, k, section_filter, doc_type_filter)
-
-        if not results:
-            return GeminiAnswer(
-                question=question,
-                answer="I could not find relevant information in the portfolio to answer this question.",
-                sources=[],
-            )
-
-        context  = _build_context_block(results)
-        user_msg = _build_user_message(question, context)
-        sources  = _extract_sources(results)
-
-        if _is_claude_model(self.gemini_model):
-            return self._answer_claude(question, user_msg, sources, session_id)
-        else:
-            return self._answer_gemini(question, user_msg, sources, session_id)
-
-    def _answer_gemini(self, question, user_msg, sources, session_id):
-        logger.info("Calling Gemini [%s] session=%s", self.gemini_model, session_id)
-        try:
-            chat     = self._get_gemini_chat(session_id)
-            response = chat.send_message(user_msg)
-            answer_text = response.text or ""
-            tokens_used = (
-                response.usage_metadata.total_token_count
-                if response.usage_metadata else 0
-            )
-        except Exception as exc:
-            logger.error("Gemini call failed: %s", exc)
-            return GeminiAnswer(question=question, answer=f"Error calling Gemini: {exc}", sources=sources)
-
-        return GeminiAnswer(
-            question=question,
-            answer=answer_text,
-            sources=sources,
-            total_tokens_used=tokens_used,
-        )
-
-    def _answer_claude(self, question, user_msg, sources, session_id):
         import anthropic
-        logger.info("Calling Claude [%s] session=%s", self.gemini_model, session_id)
-        client  = anthropic.Anthropic(api_key=self._anthropic_key)
-        history = self._get_claude_history(session_id)
-        messages = history + [{"role": "user", "content": user_msg}]
+
+        k        = top_k or self.top_k
+        client   = anthropic.Anthropic(api_key=self._anthropic_key)
+        history  = self._get_history(session_id)
+        messages = list(history) + [{"role": "user", "content": question}]
+
+        all_sources: list[Source] = []
+        tokens_used: int          = 0
+
+        logger.info("Claude answer [%s] session=%s", self.model, session_id)
 
         try:
-            response = client.messages.create(
-                model=self.gemini_model,
-                max_tokens=2048,
-                system=self._system,
-                messages=messages,
-            )
-            answer_text = response.content[0].text if response.content else ""
-            tokens_used = response.usage.input_tokens + response.usage.output_tokens
-        except Exception as exc:
-            logger.error("Claude call failed: %s", exc)
-            return GeminiAnswer(question=question, answer=f"Error calling Claude: {exc}", sources=sources)
+            while True:
+                response = client.messages.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    system=self._system,
+                    tools=[_SEARCH_TOOL],
+                    messages=messages,
+                )
+                tokens_used += response.usage.input_tokens + response.usage.output_tokens
 
-        self._append_claude_turn(session_id, user_msg, answer_text)
-        return GeminiAnswer(
-            question=question,
-            answer=answer_text,
-            sources=sources,
-            total_tokens_used=tokens_used,
-        )
+                if response.stop_reason == "end_turn":
+                    answer_text = " ".join(
+                        b.text for b in response.content
+                        if hasattr(b, "text") and b.text
+                    )
+                    self._save_turn(session_id, question, _blocks_to_dicts(response.content))
+                    return GeminiAnswer(
+                        question=question,
+                        answer=answer_text,
+                        sources=all_sources,
+                        total_tokens_used=tokens_used,
+                    )
+
+                if response.stop_reason == "tool_use":
+                    messages.append({"role": "assistant", "content": _blocks_to_dicts(response.content)})
+                    tool_results = []
+                    for block in response.content:
+                        if getattr(block, "type", None) != "tool_use":
+                            continue
+                        if block.name == "search_portfolio":
+                            logger.info("Tool call: %s", json.dumps(dict(block.input)))
+                            context, sources = self._run_search_tool(
+                                dict(block.input), k, section_filter, doc_type_filter
+                            )
+                            all_sources.extend(sources)
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id, "content": context,
+                            })
+                        else:
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id,
+                                "content": f"Unknown tool: {block.name}", "is_error": True,
+                            })
+                    messages.append({"role": "user", "content": tool_results})
+                else:
+                    logger.warning("Unexpected stop_reason: %s", response.stop_reason)
+                    break
+
+        except Exception as exc:
+            logger.error("Claude answer failed: %s", exc)
+            return GeminiAnswer(question=question, answer=f"Error: {exc}", sources=all_sources)
+
+        return GeminiAnswer(question=question, answer="(no response)",
+                            sources=all_sources, total_tokens_used=tokens_used)
 
     # ------------------------------------------------------------------
     # Public API — stream_answer()
@@ -324,84 +368,103 @@ class GeminiRAG:
         doc_type_filter: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> Generator[str, None, GeminiAnswer]:
-        k = top_k or self.top_k
-        results = self._retrieve(question, k, section_filter, doc_type_filter)
+        return (yield from self._stream_claude(
+            question,
+            top_k or self.top_k,
+            section_filter,
+            doc_type_filter,
+            session_id,
+        ))
 
-        if not results:
-            yield "I could not find relevant information in the portfolio to answer this question."
-            return GeminiAnswer(question=question, answer="No relevant chunks found.", sources=[])
+    # ------------------------------------------------------------------
+    # Claude streaming — tool-use loop
+    # ------------------------------------------------------------------
 
-        context  = _build_context_block(results)
-        user_msg = _build_user_message(question, context)
-        sources  = _extract_sources(results)
-
-        if _is_claude_model(self.gemini_model):
-            return (yield from self._stream_claude(question, user_msg, sources, session_id))
-        else:
-            return (yield from self._stream_gemini(question, user_msg, sources, session_id))
-
-    def _stream_gemini(self, question, user_msg, sources, session_id):
-        chat = self._get_gemini_chat(session_id)
-        full_text:   list[str] = []
-        tokens_used: int       = 0
-        try:
-            for chunk in chat.send_message_stream(user_msg):
-                token = chunk.text or ""
-                if token:
-                    full_text.append(token)
-                    yield token
-                if chunk.usage_metadata:
-                    tokens_used = chunk.usage_metadata.total_token_count or 0
-        except Exception as exc:
-            err = f"\n[Gemini streaming error: {exc}]"
-            full_text.append(err)
-            yield err
-
-        return GeminiAnswer(
-            question=question,
-            answer="".join(full_text),
-            sources=sources,
-            total_tokens_used=tokens_used,
-        )
-
-    def _stream_claude(self, question, user_msg, sources, session_id):
+    def _stream_claude(self, question, default_top_k, default_section, default_doc_type, session_id):
+        """
+        Single streaming call per loop iteration.
+        Tool-call rounds buffer text (not yielded); final end_turn yields tokens.
+        Content blocks always stored as plain dicts — never raw SDK objects.
+        """
         import anthropic
-        client  = anthropic.Anthropic(api_key=self._anthropic_key)
-        history = self._get_claude_history(session_id)
-        messages = history + [{"role": "user", "content": user_msg}]
 
-        full_text:   list[str] = []
-        tokens_used: int       = 0
+        client   = anthropic.Anthropic(api_key=self._anthropic_key)
+        history  = self._get_history(session_id)
+        messages = list(history) + [{"role": "user", "content": question}]
+
+        all_sources:   list[Source] = []
+        tokens_used:   int          = 0
+        full_text:     list[str]    = []
+        final_content: list[dict]   = []
+
+        logger.info("Claude stream [%s] session=%s", self.model, session_id)
+
         try:
-            with client.messages.stream(
-                model=self.gemini_model,
-                max_tokens=2048,
-                system=self._system,
-                messages=messages,
-            ) as stream:
-                for token in stream.text_stream:
-                    if token:
+            while True:
+                with anthropic.Anthropic(api_key=self._anthropic_key).messages.stream(
+                    model=self.model,
+                    max_tokens=2048,
+                    system=self._system,
+                    tools=[_SEARCH_TOOL],
+                    messages=messages,
+                ) as stream:
+                    turn_text: list[str] = []
+                    for token in stream.text_stream:
+                        if token:
+                            turn_text.append(token)
+
+                    final_msg    = stream.get_final_message()
+                    tokens_used += final_msg.usage.input_tokens + final_msg.usage.output_tokens
+
+                if final_msg.stop_reason == "end_turn":
+                    for token in turn_text:
                         full_text.append(token)
                         yield token
-                final = stream.get_final_message()
-                tokens_used = final.usage.input_tokens + final.usage.output_tokens
+                    final_content = _blocks_to_dicts(final_msg.content)
+                    break
+
+                if final_msg.stop_reason == "tool_use":
+                    messages.append({"role": "assistant", "content": _blocks_to_dicts(final_msg.content)})
+                    tool_results = []
+                    for block in final_msg.content:
+                        if getattr(block, "type", None) != "tool_use":
+                            continue
+                        if block.name == "search_portfolio":
+                            logger.info("Tool call: %s", json.dumps(dict(block.input)))
+                            context, sources = self._run_search_tool(
+                                dict(block.input), default_top_k, default_section, default_doc_type
+                            )
+                            all_sources.extend(sources)
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id, "content": context,
+                            })
+                        else:
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id,
+                                "content": f"Unknown tool: {block.name}", "is_error": True,
+                            })
+                    messages.append({"role": "user", "content": tool_results})
+                else:
+                    logger.warning("Unexpected stop_reason: %s", final_msg.stop_reason)
+                    break
+
         except Exception as exc:
             err = f"\n[Claude streaming error: {exc}]"
             full_text.append(err)
             yield err
 
-        answer_text = "".join(full_text)
-        self._append_claude_turn(session_id, user_msg, answer_text)
+        if final_content:
+            self._save_turn(session_id, question, final_content)
 
         return GeminiAnswer(
             question=question,
-            answer=answer_text,
-            sources=sources,
+            answer="".join(full_text),
+            sources=all_sources,
             total_tokens_used=tokens_used,
         )
 
     # ------------------------------------------------------------------
-    # Internal
+    # Internal retrieval
     # ------------------------------------------------------------------
 
     def _retrieve(
