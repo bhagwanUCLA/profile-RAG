@@ -3,16 +3,15 @@ rag_query.py
 ------------
 ClaudeRAG — end-to-end RAG query class using Anthropic Claude with tool-use.
 
-RAG retrieval is exposed as a `search_portfolio` tool that Claude calls
-when it needs information, rather than always pre-retrieving.
+Streaming architecture
+----------------------
+_stream_claude is a synchronous generator.  It MUST be driven from a
+background thread (via server.py's ThreadPoolExecutor + queue.Queue) so it
+never blocks the asyncio event loop.
 
-Two query modes
----------------
-answer(question)        → single-shot answer
-stream_answer(question) → yields text tokens as they arrive (streaming)
-
-Both accept an optional session_id (str). Pass the same id across calls
-to maintain a conversation. Omit / pass None for a stateless one-shot query.
+Tokens are yielded in real time during stream.text_stream.  This is safe
+because Claude emits zero text tokens in tool-use rounds — text only appears
+in the final end_turn round.
 """
 
 from __future__ import annotations
@@ -183,7 +182,7 @@ def _blocks_to_dicts(content_blocks) -> list[dict]:
 # Session store
 # ---------------------------------------------------------------------------
 
-_claude_histories: dict[str, list[dict]] = {}  # session_id → [{role, content}]
+_claude_histories: dict[str, list[dict]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -194,21 +193,13 @@ class GeminiRAG:
     """
     Retrieval-augmented generation using FAISSDatabase + Anthropic Claude tool-use.
 
-    The class is still named GeminiRAG for API compatibility with server.py.
-
-    Parameters
-    ----------
-    db                : FAISSDatabase — populated vector store.
-    gemini_api_key    : Unused (kept for API compatibility with server.py).
-    anthropic_api_key : Anthropic API key.
-    gemini_model      : Claude model name (e.g. 'claude-sonnet-4-6').
-    top_k             : Default number of chunks to retrieve per tool call.
-    system_prompt     : Override the default system prompt if needed.
+    Named GeminiRAG for API compatibility with server.py.
     """
 
     def __init__(
         self,
         db: FAISSDatabase,
+        gemini_api_key: str = "",        # ignored — kept for server.py compat
         anthropic_api_key: str = "",
         gemini_model: str = "claude-sonnet-4-6",
         top_k: int = 6,
@@ -218,7 +209,6 @@ class GeminiRAG:
         self.model          = gemini_model
         self.top_k          = top_k
         self._system        = system_prompt or _SYSTEM_PROMPT
-        # Key resolution: constructor arg → env var
         self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 
     # ------------------------------------------------------------------
@@ -230,10 +220,6 @@ class GeminiRAG:
 
     def list_sessions(self) -> list[str]:
         return list(_claude_histories.keys())
-
-    # ------------------------------------------------------------------
-    # History helpers
-    # ------------------------------------------------------------------
 
     def _get_history(self, session_id: Optional[str]) -> list[dict]:
         if not session_id:
@@ -325,7 +311,8 @@ class GeminiRAG:
                     )
 
                 if response.stop_reason == "tool_use":
-                    messages.append({"role": "assistant", "content": _blocks_to_dicts(response.content)})
+                    messages.append({"role": "assistant",
+                                     "content": _blocks_to_dicts(response.content)})
                     tool_results = []
                     for block in response.content:
                         if getattr(block, "type", None) != "tool_use":
@@ -337,12 +324,16 @@ class GeminiRAG:
                             )
                             all_sources.extend(sources)
                             tool_results.append({
-                                "type": "tool_result", "tool_use_id": block.id, "content": context,
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": context,
                             })
                         else:
                             tool_results.append({
-                                "type": "tool_result", "tool_use_id": block.id,
-                                "content": f"Unknown tool: {block.name}", "is_error": True,
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": f"Unknown tool: {block.name}",
+                                "is_error": True,
                             })
                     messages.append({"role": "user", "content": tool_results})
                 else:
@@ -351,7 +342,8 @@ class GeminiRAG:
 
         except Exception as exc:
             logger.error("Claude answer failed: %s", exc)
-            return GeminiAnswer(question=question, answer=f"Error: {exc}", sources=all_sources)
+            return GeminiAnswer(question=question, answer=f"Error: {exc}",
+                                sources=all_sources)
 
         return GeminiAnswer(question=question, answer="(no response)",
                             sources=all_sources, total_tokens_used=tokens_used)
@@ -368,6 +360,11 @@ class GeminiRAG:
         doc_type_filter: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> Generator[str, None, GeminiAnswer]:
+        """
+        Synchronous generator — MUST be driven from a background thread.
+        See server.py _run_llm_in_thread() for the correct usage pattern.
+        Yields text tokens; returns GeminiAnswer via StopIteration.value.
+        """
         return (yield from self._stream_claude(
             question,
             top_k or self.top_k,
@@ -377,14 +374,24 @@ class GeminiRAG:
         ))
 
     # ------------------------------------------------------------------
-    # Claude streaming — tool-use loop
+    # Claude streaming tool-use loop  (blocking — runs in a thread)
     # ------------------------------------------------------------------
 
-    def _stream_claude(self, question, default_top_k, default_section, default_doc_type, session_id):
+    def _stream_claude(
+        self,
+        question: str,
+        default_top_k: int,
+        default_section: Optional[str],
+        default_doc_type: Optional[str],
+        session_id: Optional[str],
+    ) -> Generator[str, None, GeminiAnswer]:
         """
-        Single streaming call per loop iteration.
-        Tool-call rounds buffer text (not yielded); final end_turn yields tokens.
-        Content blocks always stored as plain dicts — never raw SDK objects.
+        Sync generator.  Yields tokens in real time.
+
+        Why real-time yield is safe:
+          Claude emits NO text tokens during tool-use rounds.  Text only
+          appears in the final end_turn round, so yielding immediately never
+          leaks intermediate tool-call output to the client.
         """
         import anthropic
 
@@ -401,30 +408,35 @@ class GeminiRAG:
 
         try:
             while True:
-                with anthropic.Anthropic(api_key=self._anthropic_key).messages.stream(
+                with client.messages.stream(
                     model=self.model,
                     max_tokens=2048,
                     system=self._system,
                     tools=[_SEARCH_TOOL],
                     messages=messages,
                 ) as stream:
-                    turn_text: list[str] = []
+                    # Yield tokens as they arrive.
+                    # Tool-use rounds produce no text, so this only fires on end_turn.
                     for token in stream.text_stream:
                         if token:
-                            turn_text.append(token)
+                            full_text.append(token)
+                            yield token                   # ← real-time, not buffered
 
                     final_msg    = stream.get_final_message()
-                    tokens_used += final_msg.usage.input_tokens + final_msg.usage.output_tokens
+                    tokens_used += (final_msg.usage.input_tokens
+                                    + final_msg.usage.output_tokens)
 
+                # end_turn — we're done
                 if final_msg.stop_reason == "end_turn":
-                    for token in turn_text:
-                        full_text.append(token)
-                        yield token
                     final_content = _blocks_to_dicts(final_msg.content)
                     break
 
+                # tool_use — execute tools and loop back
                 if final_msg.stop_reason == "tool_use":
-                    messages.append({"role": "assistant", "content": _blocks_to_dicts(final_msg.content)})
+                    messages.append({
+                        "role":    "assistant",
+                        "content": _blocks_to_dicts(final_msg.content),
+                    })
                     tool_results = []
                     for block in final_msg.content:
                         if getattr(block, "type", None) != "tool_use":
@@ -432,24 +444,32 @@ class GeminiRAG:
                         if block.name == "search_portfolio":
                             logger.info("Tool call: %s", json.dumps(dict(block.input)))
                             context, sources = self._run_search_tool(
-                                dict(block.input), default_top_k, default_section, default_doc_type
+                                dict(block.input),
+                                default_top_k,
+                                default_section,
+                                default_doc_type,
                             )
                             all_sources.extend(sources)
                             tool_results.append({
-                                "type": "tool_result", "tool_use_id": block.id, "content": context,
+                                "type":        "tool_result",
+                                "tool_use_id": block.id,
+                                "content":     context,
                             })
                         else:
                             tool_results.append({
-                                "type": "tool_result", "tool_use_id": block.id,
-                                "content": f"Unknown tool: {block.name}", "is_error": True,
+                                "type":        "tool_result",
+                                "tool_use_id": block.id,
+                                "content":     f"Unknown tool: {block.name}",
+                                "is_error":    True,
                             })
                     messages.append({"role": "user", "content": tool_results})
+
                 else:
                     logger.warning("Unexpected stop_reason: %s", final_msg.stop_reason)
                     break
 
         except Exception as exc:
-            err = f"\n[Claude streaming error: {exc}]"
+            err = f"\n[Error: {exc}]"
             full_text.append(err)
             yield err
 

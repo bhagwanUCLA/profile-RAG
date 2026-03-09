@@ -3,43 +3,34 @@ server.py
 ---------
 FastAPI backend for the Portfolio RAG pipeline.
 
-New in this version
--------------------
-- Conversational chat: every /query/stream call accepts a `session_id`.
-  Passing the same session_id across requests makes the LLM remember
-  previous turns (Gemini via chats.create, Claude via message history).
-- Claude model support: any model name starting with "claude" is routed
-  through the Anthropic SDK.
-- GET /sessions              — list active session ids
-- DELETE /sessions/{id}      — clear a specific session
-- DELETE /sessions           — clear all sessions
+Streaming architecture
+----------------------
+The Anthropic SDK is synchronous and blocking.  Running it directly inside
+an `async def` would freeze the entire uvicorn event loop for the duration
+of each Claude call, causing gunicorn WORKER TIMEOUT on longer queries.
 
-Endpoints
----------
-POST /ingest          — scrape & index a portfolio URL
-POST /config          — update pipeline config
-GET  /config          — read current config
-GET  /query/stream    — SSE streaming query (pass session_id for chat)
-POST /query           — single-shot query
-GET  /stats           — cache + index statistics
-DELETE /cache         — wipe scraper cache
-DELETE /index         — wipe FAISS index
-GET  /sessions        — list sessions
-DELETE /sessions/{id} — clear one session
-DELETE /sessions      — clear all sessions
-GET  /health          — liveness probe
+Solution: _run_llm_in_thread() submits the sync stream_answer generator to a
+ThreadPoolExecutor.  The generator puts ('token', text), ('done', answer),
+or ('error', msg) items into a thread-safe queue.Queue.  The async
+event_stream() coroutine polls that queue with short sleeps, keeping the
+event loop free for other requests and heartbeat keepalives.
+
+Gunicorn start command (Render):
+  gunicorn -k uvicorn.workers.UvicornWorker server:app --bind 0.0.0.0:$PORT --timeout 120
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
+import queue as _sync_queue
 from typing import AsyncGenerator, Optional
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -63,27 +54,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Thread pool for blocking Anthropic SDK calls
+# (one thread per concurrent streaming request)
+_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG = {
-    "gemini_api_key":   os.environ.get("GEMINI_API_KEY", ""),
+    "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-    "hf_model_name":    "gemini-embedding-001",
-    "chunk_size":       500,
-    "chunk_overlap":    50,
-    "dedup_threshold":  None,
-    "min_tokens":       20,
-    "index_dir":        "./rag_index",
-    "cache_dir":        "./scraper_cache",
-    "follow_external":  True,
-    "device":           "cpu",
-    "gemini_model":     "gemini-2.0-flash",
-    "top_k":            6,
+    "hf_model_name":     "gemini-embedding-001",
+    "chunk_size":        500,
+    "chunk_overlap":     50,
+    "dedup_threshold":   None,
+    "min_tokens":        20,
+    "index_dir":         "./rag_index",
+    "cache_dir":         "./scraper_cache",
+    "follow_external":   True,
+    "device":            "cpu",
+    "gemini_model":      "claude-sonnet-4-6",
+    "top_k":             6,
 }
 
-_current_config: dict = dict(_DEFAULT_CONFIG)
+_current_config: dict          = dict(_DEFAULT_CONFIG)
 _rag:            Optional[RAGOrchestrator] = None
 
 
@@ -111,6 +107,7 @@ def _get_gemini_rag(
 ) -> GeminiRAG:
     return GeminiRAG(
         db=_get_rag().db,
+        gemini_api_key=_current_config["gemini_api_key"],
         anthropic_api_key=_current_config["anthropic_api_key"],
         gemini_model=model_override or _current_config["gemini_model"],
         top_k=_current_config["top_k"],
@@ -123,19 +120,19 @@ def _get_gemini_rag(
 # ---------------------------------------------------------------------------
 
 class ConfigUpdate(BaseModel):
-    gemini_api_key:   Optional[str]   = None
-    anthropic_api_key: Optional[str]  = None
-    hf_model_name:    Optional[str]   = None
-    chunk_size:       Optional[int]   = None
-    chunk_overlap:    Optional[int]   = None
-    dedup_threshold:  Optional[float] = None
-    min_tokens:       Optional[int]   = None
-    index_dir:        Optional[str]   = None
-    cache_dir:        Optional[str]   = None
-    follow_external:  Optional[bool]  = None
-    device:           Optional[str]   = None
-    gemini_model:     Optional[str]   = None
-    top_k:            Optional[int]   = None
+    gemini_api_key:    Optional[str]   = None
+    anthropic_api_key: Optional[str]   = None
+    hf_model_name:     Optional[str]   = None
+    chunk_size:        Optional[int]   = None
+    chunk_overlap:     Optional[int]   = None
+    dedup_threshold:   Optional[float] = None
+    min_tokens:        Optional[int]   = None
+    index_dir:         Optional[str]   = None
+    cache_dir:         Optional[str]   = None
+    follow_external:   Optional[bool]  = None
+    device:            Optional[str]   = None
+    gemini_model:      Optional[str]   = None
+    top_k:             Optional[int]   = None
 
 
 class IngestRequest(BaseModel):
@@ -145,12 +142,52 @@ class IngestRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question:        str
-    top_k:           int            = Field(default=6, ge=1, le=20)
-    section_filter:  Optional[str]  = None
-    doc_type_filter: Optional[str]  = None
-    system_prompt:   Optional[str]  = None
-    gemini_model:    Optional[str]  = None
-    session_id:      Optional[str]  = None
+    top_k:           int           = Field(default=6, ge=1, le=20)
+    section_filter:  Optional[str] = None
+    doc_type_filter: Optional[str] = None
+    system_prompt:   Optional[str] = None
+    gemini_model:    Optional[str] = None
+    session_id:      Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Thread-pool helper
+# ---------------------------------------------------------------------------
+
+def _run_llm_in_thread(
+    g: GeminiRAG,
+    question: str,
+    top_k: int,
+    section_filter: Optional[str],
+    doc_type_filter: Optional[str],
+    session_id: Optional[str],
+    token_queue: "_sync_queue.Queue[tuple[str, object]]",
+) -> None:
+    """
+    Runs stream_answer() synchronously in a worker thread.
+    Puts items into token_queue:
+      ('token', str)          — one text token
+      ('done',  GeminiAnswer) — generator exhausted normally
+      ('error', str)          — exception message
+    """
+    try:
+        gen = g.stream_answer(
+            question=question,
+            top_k=top_k,
+            section_filter=section_filter,
+            doc_type_filter=doc_type_filter,
+            session_id=session_id,
+        )
+        while True:
+            try:
+                token = next(gen)
+                token_queue.put(("token", token))
+            except StopIteration as e:
+                token_queue.put(("done", e.value))
+                return
+    except Exception as exc:
+        logger.error("LLM thread error: %s", exc)
+        token_queue.put(("error", str(exc)))
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +242,12 @@ def stats():
 
 @app.get("/sessions")
 def list_sessions():
-    g = _get_gemini_rag()
-    return {"sessions": g.list_sessions()}
+    return {"sessions": _get_gemini_rag().list_sessions()}
 
 
 @app.delete("/sessions/{session_id}")
 def clear_session(session_id: str):
-    g = _get_gemini_rag()
-    g.clear_session(session_id)
+    _get_gemini_rag().clear_session(session_id)
     return {"cleared": session_id}
 
 
@@ -225,29 +260,7 @@ def clear_all_sessions():
 
 
 # ---------------------------------------------------------------------------
-# Generator helper — safe outside async (avoids PEP 479 StopIteration→RuntimeError)
-# ---------------------------------------------------------------------------
-
-def _advance(gen):
-    """
-    Advance a sync generator by one step in a plain synchronous frame.
-
-    Inside an async def, Python (PEP 479) converts StopIteration → RuntimeError,
-    so `except StopIteration` never fires there.  Wrapping next() in this helper
-    keeps it in a regular frame where StopIteration propagates normally.
-
-    Returns:
-        (token, False, None)       — generator yielded a value
-        (None,  True,  ret_value)  — generator exhausted; ret_value is GeminiAnswer
-    """
-    try:
-        return next(gen), False, None
-    except StopIteration as e:
-        return None, True, e.value
-
-
-# ---------------------------------------------------------------------------
-# Query — streaming SSE (main endpoint used by frontend)
+# Query — streaming SSE
 # ---------------------------------------------------------------------------
 
 @app.get("/query/stream")
@@ -262,21 +275,14 @@ async def query_stream(
 ):
     """
     SSE streaming endpoint.
-    Emits:
-      event: chunk   — each retrieved chunk (before generation)
-      event: token   — each LLM text token
-      event: done    — final metadata (sources, tokens_used)
-      event: error   — on failure
+    Events: chunk | token | done | error | ping
     """
     rag = _get_rag()
-    g   = _get_gemini_rag(
-        system_prompt=system_prompt,
-        model_override=gemini_model,
-    )
+    g   = _get_gemini_rag(system_prompt=system_prompt, model_override=gemini_model)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
-            # 1. Send retrieved chunks
+            # ── 1. Retrieved chunks (fast, sync-safe) ────────────────
             chunks = rag.query(
                 question=question,
                 top_k=top_k,
@@ -298,26 +304,47 @@ async def query_stream(
                 yield f"event: chunk\ndata: {payload}\n\n"
                 await asyncio.sleep(0)
 
-            # 2. Stream tokens
-            gen          = g.stream_answer(
-                question=question,
-                top_k=top_k,
-                section_filter=section_filter,
-                doc_type_filter=doc_type_filter,
-                session_id=session_id,
-            )
-            # Drive the sync generator via _advance() — never catch StopIteration
-            # inside an async frame (PEP 479 converts it to RuntimeError there).
-            final_answer = None
-            while True:
-                token, exhausted, ret = _advance(gen)
-                if exhausted:
-                    final_answer = ret
-                    break
-                yield f"event: token\ndata: {json.dumps(token)}\n\n"
-                await asyncio.sleep(0)
+            # ── 2. LLM streaming in a background thread ───────────────
+            # The Anthropic SDK is blocking.  We run the sync generator
+            # in a ThreadPoolExecutor and ferry results back via a Queue
+            # so the event loop is never blocked.
+            token_queue: _sync_queue.Queue = _sync_queue.Queue()
+            loop = asyncio.get_event_loop()
 
-            # 3. Done event
+            future = loop.run_in_executor(
+                _thread_pool,
+                _run_llm_in_thread,
+                g, question, top_k, section_filter, doc_type_filter,
+                session_id, token_queue,
+            )
+
+            ping_counter = 0
+            final_answer = None
+
+            while True:
+                try:
+                    kind, value = token_queue.get_nowait()
+                except _sync_queue.Empty:
+                    # Keep connection alive with a ping every ~5 s
+                    ping_counter += 1
+                    if ping_counter % 100 == 0:
+                        yield ": ping\n\n"
+                    await asyncio.sleep(0.05)
+                    continue
+
+                if kind == "token":
+                    yield f"event: token\ndata: {json.dumps(value)}\n\n"
+                elif kind == "done":
+                    final_answer = value
+                    break
+                elif kind == "error":
+                    yield f"event: error\ndata: {json.dumps(value)}\n\n"
+                    break
+
+            # Wait for thread to finish cleanly
+            await asyncio.wrap_future(future)
+
+            # ── 3. Done event ─────────────────────────────────────────
             if final_answer:
                 done_payload = json.dumps({
                     "tokens_used": final_answer.total_tokens_used,
@@ -343,14 +370,15 @@ async def query_stream(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
+            "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
         },
     )
 
 
 # ---------------------------------------------------------------------------
-# Query — single-shot (non-streaming)
+# Query — single-shot POST
 # ---------------------------------------------------------------------------
 
 @app.post("/query")
@@ -382,16 +410,16 @@ def query(body: QueryRequest):
         "tokens_used": result.total_tokens_used,
         "chunks": [
             {
-                "rank":         i + 1,
-                "score":        r["score"],
-                "doc_index":    r["doc_index"],
-                "doc_title":    r["doc_title"],
-                "section":      r["section"],
-                "doc_type":     r["doc_type"],
-                "doc_url":      r["doc_url"],
-                "chunk_index":  r["chunk_index"],
-                "raw_content":  r["raw_content"],
-                "full_text":    r["text"],
+                "rank":        i + 1,
+                "score":       r["score"],
+                "doc_index":   r["doc_index"],
+                "doc_title":   r["doc_title"],
+                "section":     r["section"],
+                "doc_type":    r["doc_type"],
+                "doc_url":     r["doc_url"],
+                "chunk_index": r["chunk_index"],
+                "raw_content": r["raw_content"],
+                "full_text":   r["text"],
             }
             for i, r in enumerate(chunks)
         ],
