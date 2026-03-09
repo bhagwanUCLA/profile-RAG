@@ -71,7 +71,7 @@ _DEFAULT_CONFIG = {
     "gemini_api_key":   os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "hf_model_name":    "gemini-embedding-001",
-    "chunk_size":       3000,
+    "chunk_size":       500,
     "chunk_overlap":    50,
     "dedup_threshold":  None,
     "min_tokens":       20,
@@ -111,6 +111,7 @@ def _get_gemini_rag(
 ) -> GeminiRAG:
     return GeminiRAG(
         db=_get_rag().db,
+        gemini_api_key=_current_config["gemini_api_key"],
         anthropic_api_key=_current_config["anthropic_api_key"],
         gemini_model=model_override or _current_config["gemini_model"],
         top_k=_current_config["top_k"],
@@ -225,6 +226,28 @@ def clear_all_sessions():
 
 
 # ---------------------------------------------------------------------------
+# Generator helper — safe outside async (avoids PEP 479 StopIteration→RuntimeError)
+# ---------------------------------------------------------------------------
+
+def _advance(gen):
+    """
+    Advance a sync generator by one step in a plain synchronous frame.
+
+    Inside an async def, Python (PEP 479) converts StopIteration → RuntimeError,
+    so `except StopIteration` never fires there.  Wrapping next() in this helper
+    keeps it in a regular frame where StopIteration propagates normally.
+
+    Returns:
+        (token, False, None)       — generator yielded a value
+        (None,  True,  ret_value)  — generator exhausted; ret_value is GeminiAnswer
+    """
+    try:
+        return next(gen), False, None
+    except StopIteration as e:
+        return None, True, e.value
+
+
+# ---------------------------------------------------------------------------
 # Query — streaming SSE (main endpoint used by frontend)
 # ---------------------------------------------------------------------------
 
@@ -284,14 +307,16 @@ async def query_stream(
                 doc_type_filter=doc_type_filter,
                 session_id=session_id,
             )
+            # Drive the sync generator via _advance() — never catch StopIteration
+            # inside an async frame (PEP 479 converts it to RuntimeError there).
             final_answer = None
-            try:
-                while True:
-                    token = next(gen)
-                    yield f"event: token\ndata: {json.dumps(token)}\n\n"
-                    await asyncio.sleep(0)
-            except StopIteration as e:
-                final_answer = e.value
+            while True:
+                token, exhausted, ret = _advance(gen)
+                if exhausted:
+                    final_answer = ret
+                    break
+                yield f"event: token\ndata: {json.dumps(token)}\n\n"
+                await asyncio.sleep(0)
 
             # 3. Done event
             if final_answer:
