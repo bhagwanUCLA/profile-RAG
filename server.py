@@ -111,7 +111,6 @@ def _get_gemini_rag(
 ) -> GeminiRAG:
     return GeminiRAG(
         db=_get_rag().db,
-        gemini_api_key=_current_config["gemini_api_key"],
         anthropic_api_key=_current_config["anthropic_api_key"],
         gemini_model=model_override or _current_config["gemini_model"],
         top_k=_current_config["top_k"],
