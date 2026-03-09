@@ -57,7 +57,7 @@ class RAGOrchestrator:
         self,
         gemini_api_key: str,
         hf_model_name: str = "gemini-embedding-001",
-        chunk_size: int = 500,
+        chunk_size: int = 3500,
         chunk_overlap: int = 50,
         dedup_threshold: Optional[float] = None,
         min_tokens: int = 30,
