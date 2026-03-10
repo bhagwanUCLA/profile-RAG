@@ -67,7 +67,7 @@ _DEFAULT_CONFIG = {
     "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "hf_model_name":     "gemini-embedding-001",
-    "chunk_size":        500,
+    "chunk_size":        3500,
     "chunk_overlap":     50,
     "dedup_threshold":   None,
     "min_tokens":        20,
@@ -148,6 +148,33 @@ class QueryRequest(BaseModel):
     system_prompt:   Optional[str] = None
     gemini_model:    Optional[str] = None
     session_id:      Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Additional request models
+# ---------------------------------------------------------------------------
+
+class FolderIngestRequest(BaseModel):
+    folder_path: str
+    section:     str  = "general"
+    recursive:   bool = True
+
+
+class RawDocumentItem(BaseModel):
+    title:    str           = "Untitled"
+    content:  str
+    section:  str           = "general"
+    url:      str           = ""
+    doc_type: str           = "text"
+
+
+class RawDocumentsRequest(BaseModel):
+    documents: list[RawDocumentItem]
+
+
+class VideosIngestRequest(BaseModel):
+    urls:    list[str]
+    section: str = "video"
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +284,84 @@ def clear_all_sessions():
     for sid in g.list_sessions():
         g.clear_session(sid)
     return {"cleared": "all"}
+
+
+# ---------------------------------------------------------------------------
+# Additional ingest endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/ingest/folder")
+def ingest_folder(body: FolderIngestRequest):
+    """
+    Ingest all supported files from a server-side directory.
+
+    Supported: .txt .md .html .pdf .docx .doc .odt .pptx .ppt
+               .xlsx .xls .xlsm .xlsb .csv .ods
+
+    Binary files are extracted via Gemini; text files are read directly.
+    The folder_path must be accessible on the server's filesystem.
+    """
+    rag = _get_rag()
+    try:
+        chunks = rag.ingest_folder(
+            folder_path=body.folder_path,
+            section=body.section,
+            recursive=body.recursive,
+        )
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(exc))
+    rag.save()
+    return {
+        "action":         "ingest_folder",
+        "folder_path":    body.folder_path,
+        "section":        body.section,
+        "chunks_stored":  chunks,
+        "stats":          rag.stats(),
+    }
+
+
+@app.post("/ingest/documents")
+def ingest_documents(body: RawDocumentsRequest):
+    """
+    Inject pre-written text documents directly into the index.
+
+    Each document goes through the normal chunker pipeline.
+    Useful for adding custom bios, CVs, notes, or any text
+    that doesn't have a URL to scrape.
+
+    Body:
+      documents: [{title, content, section, url, doc_type}, ...]
+    """
+    rag = _get_rag()
+    docs = [d.model_dump() for d in body.documents]
+    chunks = rag.ingest_raw_documents(docs)
+    rag.save()
+    return {
+        "action":        "ingest_documents",
+        "docs_received": len(docs),
+        "chunks_stored": chunks,
+        "stats":         rag.stats(),
+    }
+
+
+@app.post("/ingest/videos")
+def ingest_videos(body: VideosIngestRequest):
+    """
+    Summarise a list of YouTube video URLs or playlist URLs via Gemini.
+
+    Playlist URLs (youtube.com/playlist?list=…) are automatically expanded
+    to individual videos.  Results are cached so replaying is free.
+    """
+    rag = _get_rag()
+    chunks = rag.ingest_videos(body.urls, section=body.section)
+    rag.save()
+    return {
+        "action":        "ingest_videos",
+        "urls_received": len(body.urls),
+        "chunks_stored": chunks,
+        "stats":         rag.stats(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +545,92 @@ def query(body: QueryRequest):
 # ---------------------------------------------------------------------------
 # Danger zone
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Skip-list endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/cache/skiplist")
+def list_skiplist():
+    """
+    List all URLs that are permanently excluded from re-scraping.
+
+    These are URLs that have been manually ingested via POST /ingest/documents.
+    The scraper will silently skip them on every future ingest/rebuild.
+    """
+    urls = _get_rag().list_skipped_urls()
+    return {"count": len(urls), "urls": urls}
+
+
+@app.post("/cache/skiplist")
+def add_to_skiplist(url: str):
+    """
+    Manually add a URL to the skip list without ingesting any content.
+    Useful for URLs you know are broken and want to permanently ignore.
+    """
+    _get_rag().add_skipped_url(url)
+    return {"added": url}
+
+
+@app.delete("/cache/skiplist/{url:path}")
+def remove_from_skiplist(url: str):
+    """
+    Remove a URL from the skip list so it will be re-scraped on the next ingest.
+    Use this if you previously ingested a page manually but now want the
+    scraper to handle it automatically.
+    """
+    removed = _get_rag().remove_skipped_url(url)
+    return {"removed": url, "was_present": removed}
+
+
+@app.delete("/cache/skiplist")
+def clear_skiplist():
+    """Remove all entries from the skip list."""
+    n = _get_rag().clear_skip_list()
+    return {"cleared": n}
+
+
+@app.get("/cache/corrupt")
+def audit_corrupt_cache():
+    """
+    List all cached pages whose stored HTML is binary/compressed junk
+    (i.e. requests failed to decompress the response).
+
+    Returns each entry with:
+      url          - original requested URL
+      final_url    - actual destination URL — open this in your browser
+      content_type - Content-Type stored at scrape time
+      cache_file   - path to the .json file on the server
+
+    Workflow:
+      1. GET  /cache/corrupt          → see which URLs failed
+      2. Open each final_url manually, copy the content
+      3. POST /ingest/documents        → inject that content as raw text
+      4. DELETE /cache/corrupt         → remove the bad cache entries
+      5. The next ingest will try those URLs fresh
+    """
+    corrupt = _get_rag().audit_corrupt_cache()
+    return {
+        "corrupt_count": len(corrupt),
+        "entries": corrupt,
+    }
+
+
+@app.delete("/cache/corrupt")
+def purge_corrupt_cache():
+    """
+    Delete all corrupt cache entries (binary/compressed pages stored by
+    requests without decompressing).
+
+    After this call, run POST /ingest with the portfolio URL to re-attempt
+    those pages, or use POST /ingest/documents to inject content manually.
+    """
+    removed = _get_rag().purge_corrupt_cache()
+    return {
+        "deleted_count": len(removed),
+        "deleted": removed,
+    }
+
 
 @app.delete("/cache")
 def clear_cache():

@@ -166,6 +166,111 @@ class ScraperCache:
         except Exception as exc:
             logger.warning("cache write error (video) %s: %s", url, exc)
 
+    # ------------------------------------------------------------------
+    # Skip list  (URLs that have been manually ingested — never re-scrape)
+    # ------------------------------------------------------------------
+
+    @property
+    def _skip_path(self) -> Path:
+        return self._pages_dir.parent / "skip_list.json"
+
+    def _load_skip(self) -> set[str]:
+        try:
+            if self._skip_path.exists():
+                return set(json.loads(self._skip_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            logger.warning("skip_list read error: %s", exc)
+        return set()
+
+    def _save_skip(self, urls: set[str]) -> None:
+        try:
+            self._skip_path.write_text(
+                json.dumps(sorted(urls), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning("skip_list write error: %s", exc)
+
+    def add_skip(self, url: str) -> None:
+        """Mark a URL as manually ingested — the scraper will never fetch it again."""
+        if not url or not url.startswith(("http://", "https://")):
+            return
+        s = self._load_skip()
+        if url not in s:
+            s.add(url)
+            self._save_skip(s)
+            logger.info("skip_list: added %s", url)
+
+    def remove_skip(self, url: str) -> bool:
+        """Remove a URL from the skip list. Returns True if it was present."""
+        s = self._load_skip()
+        if url in s:
+            s.discard(url)
+            self._save_skip(s)
+            return True
+        return False
+
+    def is_skipped(self, url: str) -> bool:
+        """Return True if this URL is on the skip list."""
+        return url in self._load_skip()
+
+    def list_skipped(self) -> list[str]:
+        """Return all URLs currently on the skip list."""
+        return sorted(self._load_skip())
+
+    def clear_skip(self) -> int:
+        """Remove all entries from the skip list. Returns count removed."""
+        s = self._load_skip()
+        n = len(s)
+        self._save_skip(set())
+        return n
+
+    def find_corrupt_pages(self) -> list[dict]:
+        """
+        Scan all cached pages and return metadata for entries whose stored
+        HTML is binary/compressed junk rather than real text.
+
+        Each entry in the returned list has:
+          url          - original requested URL
+          final_url    - URL after redirects (open this manually)
+          content_type - Content-Type stored at scrape time
+          cache_file   - absolute path to the .json file on disk
+        """
+        corrupt: list[dict] = []
+        for path in sorted(self._pages_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                corrupt.append({"url": "?", "final_url": "?",
+                                "content_type": "unreadable-json",
+                                "cache_file": str(path)})
+                continue
+            if not isinstance(data, dict):
+                continue
+            if _is_corrupt_html(data.get("html", "")):
+                corrupt.append({
+                    "url":          data.get("url", "?"),
+                    "final_url":    data.get("final_url", "?"),
+                    "content_type": data.get("content_type", "?"),
+                    "cache_file":   str(path),
+                })
+        return corrupt
+
+    def delete_corrupt_pages(self) -> list[dict]:
+        """
+        Delete every corrupt cache entry and return what was removed
+        (same schema as find_corrupt_pages).
+        """
+        corrupt = self.find_corrupt_pages()
+        for entry in corrupt:
+            try:
+                Path(entry["cache_file"]).unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("Could not delete %s: %s", entry["cache_file"], exc)
+        if corrupt:
+            logger.info("Deleted %d corrupt cache entries.", len(corrupt))
+        return corrupt
+
     def stats(self) -> dict:
         return {
             "cached_pages": len(list(self._pages_dir.glob("*.json"))),
@@ -185,8 +290,44 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _is_corrupt_html(html: str, threshold: float = 0.05) -> bool:
+    """
+    Return True when `html` looks like raw binary/compressed data rather than
+    actual HTML text.
+
+    Root cause: requests sometimes fails to decompress gzip/brotli responses
+    and stores the raw bytes verbatim in the cache (the JSON you saw with all
+    the \\u0003, \\ufffd etc.).
+
+    Heuristic: real HTML is overwhelmingly printable ASCII/UTF-8.  Binary
+    blobs have a high density of low-ASCII control characters (0x00-0x1F)
+    outside the normal whitespace set {\\t \\n \\r}.  We sample the first
+    4 000 characters and flag anything above `threshold` (default 5 %).
+    """
+    if not html:
+        return True
+    sample = html[:4_000]
+    control = sum(1 for c in sample if ord(c) < 32 and c not in "\t\n\r")
+    return (control / max(len(sample), 1)) > threshold
+
+
+_YT_PLAYLIST_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?youtube\.com/(?:playlist|watch)\?(?:[^#]*&)?list=([\w\-]+)",
+    flags=re.I,
+)
+
+
 def _is_youtube(url: str) -> bool:
     return bool(_YT_PATTERN.search(url or ""))
+
+
+def _is_youtube_playlist(url: str) -> bool:
+    """True for playlist URLs — including watch?v=X&list=Y hybrid links."""
+    if not url:
+        return False
+    p = urlparse(url)
+    qs = p.query or ""
+    return bool(_YT_PLAYLIST_PATTERN.search(url)) and "list=" in qs and "watch?v=" not in url.split("?")[0]
 
 
 def _is_pdf_url(url: str) -> bool:
@@ -474,9 +615,14 @@ class PortfolioScraper:
             for ext_url, section in external_links.items():
                 if ext_url in self._visited:
                     continue
+                if self.cache and self.cache.is_skipped(ext_url):
+                    logger.info("  [skip-list] skipping manually-ingested URL: %s", ext_url)
+                    continue
                 self._visited.add(ext_url)
                 time.sleep(self.delay)
-                if _is_youtube(ext_url):
+                if _is_youtube_playlist(ext_url):
+                    docs.extend(self._process_playlist(ext_url, section))
+                elif _is_youtube(ext_url):
                     docs.extend(self._summarise_video(ext_url, section))
                 else:
                     docs.extend(self._scrape_external_page(ext_url, section))
@@ -504,9 +650,14 @@ class PortfolioScraper:
             is_ext = urlparse(link).netloc != root_domain
             if is_ext and not self.follow_external:
                 continue
+            if is_ext and self.cache and self.cache.is_skipped(link):
+                logger.info("  [skip-list] skipping manually-ingested URL: %s", link)
+                continue
             self._visited.add(link)
             time.sleep(self.delay)
-            if _is_youtube(link):
+            if _is_youtube_playlist(link):
+                docs.extend(self._process_playlist(link, section_name))
+            elif _is_youtube(link):
                 docs.extend(self._summarise_video(link, section_name))
             else:
                 if is_ext:
@@ -613,12 +764,19 @@ class PortfolioScraper:
         Handles YouTube redirect detection: if the final URL after following
         redirects turns out to be a YouTube URL, delegates to _summarise_video.
         """
+        # ── Skip-list check ──────────────────────────────────────────
+        if self.cache and self.cache.is_skipped(url):
+            logger.info("  [skip-list] skipping manually-ingested URL: %s", url)
+            return []
+
         # ── Cache hit path ────────────────────────────────────────────
         if self.cache:
             cached = self.cache.get_page(url)
             if cached:
                 final_url = cached.get("final_url", url)
-                # Check if cached page was actually a YouTube redirect
+                # Check if cached page was actually a YouTube/playlist redirect
+                if _is_youtube_playlist(final_url):
+                    return self._process_playlist(final_url, section)
                 if _is_youtube(final_url):
                     return self._summarise_video(final_url, section)
                 ct = cached.get("content_type", "")
@@ -644,6 +802,10 @@ class PortfolioScraper:
 
         # ── YouTube redirect detection ────────────────────────────────
         # The raw URL may be an opaque redirect; check the final destination.
+        if _is_youtube_playlist(final_url):
+            logger.info("  [playlist redirect] %s -> %s", url, final_url)
+            self._visited.add(final_url)
+            return self._process_playlist(final_url, section)
         if _is_youtube(final_url):
             logger.info("  [YouTube redirect] %s -> %s", url, final_url)
             self._visited.add(final_url)
@@ -671,6 +833,11 @@ class PortfolioScraper:
 
         # ── HTML path ─────────────────────────────────────────────────
         html = resp.text
+        if _is_corrupt_html(html):
+            logger.warning(
+                "Skipping corrupt (binary/compressed) response for %s", final_url
+            )
+            return []
         if self.cache:
             self.cache.set_page(url, final_url, html, ct or "text/html")
             if final_url != url:
@@ -826,6 +993,81 @@ class PortfolioScraper:
                     pass
 
     # ------------------------------------------------------------------
+    # Playlist expansion
+    # ------------------------------------------------------------------
+
+    def _process_playlist(self, playlist_url: str, section: str) -> list[ScrapedDocument]:
+        """
+        Expand a YouTube playlist URL into individual video URLs and summarise each.
+
+        Strategy: fetch the playlist page HTML and extract video IDs from the
+        embedded JSON data (no API key required).  Falls back gracefully if the
+        page cannot be fetched or yields no IDs.
+        """
+        logger.info("  [playlist] expanding %s", playlist_url)
+
+        # Check cache for already-expanded playlists
+        if self.cache:
+            cached = self.cache.get_page(playlist_url)
+            if cached:
+                # Cached as HTML wrapper — extract video IDs from stored content
+                html = cached.get("html", "")
+                video_ids = self._extract_playlist_video_ids(html)
+                if video_ids:
+                    logger.info("  [playlist cache HIT] %d videos", len(video_ids))
+                    docs: list[ScrapedDocument] = []
+                    for vid in video_ids:
+                        yt_url = f"https://www.youtube.com/watch?v={vid}"
+                        if yt_url not in self._visited:
+                            self._visited.add(yt_url)
+                            docs.extend(self._summarise_video(yt_url, section))
+                    return docs
+
+        resp = self._do_get(playlist_url)
+        if resp is None:
+            logger.warning("  [playlist] could not fetch %s", playlist_url)
+            return []
+
+        html = resp.text
+        video_ids = self._extract_playlist_video_ids(html)
+
+        if not video_ids:
+            logger.warning("  [playlist] no video IDs found in %s", playlist_url)
+            return []
+
+        logger.info("  [playlist] found %d videos in %s", len(video_ids), playlist_url)
+
+        # Cache the raw playlist HTML so rebuild_index doesn't re-fetch
+        if self.cache:
+            self.cache.set_page(playlist_url, playlist_url, html, "text/html")
+
+        docs = []
+        for vid in video_ids:
+            yt_url = f"https://www.youtube.com/watch?v={vid}"
+            if yt_url in self._visited:
+                continue
+            self._visited.add(yt_url)
+            time.sleep(self.delay)
+            docs.extend(self._summarise_video(yt_url, section))
+
+        return docs
+
+    @staticmethod
+    def _extract_playlist_video_ids(html: str) -> list[str]:
+        """
+        Extract ordered unique video IDs from YouTube playlist page HTML.
+        YouTube embeds JSON payloads with "videoId":"..." entries.
+        """
+        raw_ids = re.findall(r'"videoId"\s*:\s*"([\w\-]{11})"', html)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for vid in raw_ids:
+            if vid not in seen:
+                seen.add(vid)
+                unique.append(vid)
+        return unique
+
+    # ------------------------------------------------------------------
     # Video summarisation (cache-aware)
     # ------------------------------------------------------------------
 
@@ -941,6 +1183,12 @@ class PortfolioScraper:
 
             # HTML path
             html = resp.text
+            if _is_corrupt_html(html):
+                logger.warning(
+                    "Skipping corrupt (binary/compressed) response for %s", final_url
+                )
+                return None, final_url
+
             soup = BeautifulSoup(html, "html.parser")
 
             # meta-refresh once
