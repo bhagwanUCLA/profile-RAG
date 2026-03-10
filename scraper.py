@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import collections
+import concurrent.futures
+import threading
 import hashlib
 import io
 import json
@@ -536,17 +538,19 @@ class PortfolioScraper:
         self,
         gemini_api_key: str,
         cache: Optional[ScraperCache] = None,
-        gemini_model: str = "gemini-2.0-flash",
+        gemini_model: str = "gemini-3-pro-preview",
         request_timeout: int = 20,
         request_delay: float = 0.5,
         follow_external: bool = True,
         max_crawl_pages: int = 200,
+        max_workers: int = 8,
     ) -> None:
         self.gemini_model = gemini_model
         self.timeout = request_timeout
         self.delay = request_delay
         self.follow_external = follow_external
         self.max_crawl_pages = max_crawl_pages
+        self.max_workers = max_workers
         self.cache = cache
 
         self._session = requests.Session()
@@ -558,6 +562,7 @@ class PortfolioScraper:
 
         self._doc_counter: int = 0
         self._visited: set[str] = set()
+        self._lock = threading.Lock()  # protects _visited and _doc_counter
 
     # ------------------------------------------------------------------
     # Primary entry point
@@ -612,20 +617,39 @@ class PortfolioScraper:
                                                content=content, doc_type="text"))
 
         if self.follow_external:
+            pending_ext: list[tuple[str, str]] = []
             for ext_url, section in external_links.items():
                 if ext_url in self._visited:
                     continue
                 if self.cache and self.cache.is_skipped(ext_url):
                     logger.info("  [skip-list] skipping manually-ingested URL: %s", ext_url)
                     continue
-                self._visited.add(ext_url)
+                pending_ext.append((ext_url, section))
+
+            def _fetch_external(args: tuple[str, str]) -> list[ScrapedDocument]:
+                ext_url, section = args
+                if not self._visited_add(ext_url):
+                    return []
                 time.sleep(self.delay)
                 if _is_youtube_playlist(ext_url):
-                    docs.extend(self._process_playlist(ext_url, section))
+                    return self._process_playlist(ext_url, section)
                 elif _is_youtube(ext_url):
-                    docs.extend(self._summarise_video(ext_url, section))
+                    return self._summarise_video(ext_url, section)
                 else:
-                    docs.extend(self._scrape_external_page(ext_url, section))
+                    return self._scrape_external_page(ext_url, section)
+
+            if pending_ext:
+                logger.info("  [threads] %d external URLs, %d workers",
+                            len(pending_ext), self.max_workers)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_workers, thread_name_prefix="ext"
+                ) as pool:
+                    futures = {pool.submit(_fetch_external, a): a[0] for a in pending_ext}
+                    for fut in concurrent.futures.as_completed(futures):
+                        try:
+                            docs.extend(fut.result())
+                        except Exception as exc:
+                            logger.error("  [ext thread] %s: %s", futures[fut], exc)
 
         logger.info("scrape_portfolio done: %d documents", len(docs))
         return docs
@@ -644,6 +668,7 @@ class PortfolioScraper:
             return []
         docs: list[ScrapedDocument] = [self._make_index_doc(soup=soup, url=section_url, section=section_name,
                                                            title=f"{section_name.replace('_', ' ').title()} – Index")]
+        pending: list[tuple[str, bool]] = []
         for link in _collect_links(soup, section_url):
             if link in self._visited:
                 continue
@@ -653,19 +678,33 @@ class PortfolioScraper:
             if is_ext and self.cache and self.cache.is_skipped(link):
                 logger.info("  [skip-list] skipping manually-ingested URL: %s", link)
                 continue
-            self._visited.add(link)
+            pending.append((link, is_ext))
+
+        def _fetch_link(args: tuple[str, bool]) -> list[ScrapedDocument]:
+            link, is_ext = args
+            if not self._visited_add(link):
+                return []
             time.sleep(self.delay)
             if _is_youtube_playlist(link):
-                docs.extend(self._process_playlist(link, section_name))
+                return self._process_playlist(link, section_name)
             elif _is_youtube(link):
-                docs.extend(self._summarise_video(link, section_name))
+                return self._summarise_video(link, section_name)
+            elif is_ext:
+                return self._scrape_external_page(link, section_name)
             else:
-                if is_ext:
-                    docs.extend(self._scrape_external_page(link, section_name))
-                else:
-                    doc = self._scrape_internal_page(link, section_name)
-                    if doc:
-                        docs.append(doc)
+                doc = self._scrape_internal_page(link, section_name)
+                return [doc] if doc else []
+
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers, thread_name_prefix="sec"
+            ) as pool:
+                futures = {pool.submit(_fetch_link, a): a[0] for a in pending}
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        docs.extend(fut.result())
+                    except Exception as exc:
+                        logger.error("  [section thread] %s: %s", futures[fut], exc)
         return docs
 
     def summarise_videos(self, youtube_urls: list[str], section: str = "video") -> list[ScrapedDocument]:
@@ -959,7 +998,7 @@ class PortfolioScraper:
                 )
                 raw_text = getattr(response, "text", "") or ""
             except Exception as exc:
-                logger.debug("generate_content(parts=...) failed; trying fallback: %s", exc)
+                logger.warning("generate_content(parts=...) failed; trying fallback: %s", exc)
                 try:
                     response = self._gemini.models.generate_content(
                         model=self.gemini_model,
@@ -1010,11 +1049,10 @@ class PortfolioScraper:
         if self.cache:
             cached = self.cache.get_page(playlist_url)
             if cached:
-                # Cached as HTML wrapper — extract video IDs from stored content
                 html = cached.get("html", "")
                 video_ids = self._extract_playlist_video_ids(html)
                 if video_ids:
-                    logger.info("  [playlist cache HIT] %d videos", len(video_ids))
+                    logger.info("  [playlist cache HIT] %d video(s)", len(video_ids))
                     docs: list[ScrapedDocument] = []
                     for vid in video_ids:
                         yt_url = f"https://www.youtube.com/watch?v={vid}"
@@ -1022,6 +1060,15 @@ class PortfolioScraper:
                             self._visited.add(yt_url)
                             docs.extend(self._summarise_video(yt_url, section))
                     return docs
+                else:
+                    # Cached HTML yielded no IDs — it's a stale/failed page.
+                    # Delete it so we re-fetch fresh below.
+                    logger.info(
+                        "  [playlist cache STALE] no IDs in cached HTML for %s — "
+                        "deleting and re-fetching", playlist_url
+                    )
+                    p = self.cache._pages_dir / f"{_url_hash(playlist_url)}.json"
+                    p.unlink(missing_ok=True)
 
         resp = self._do_get(playlist_url)
         if resp is None:
@@ -1032,23 +1079,49 @@ class PortfolioScraper:
         video_ids = self._extract_playlist_video_ids(html)
 
         if not video_ids:
-            logger.warning("  [playlist] no video IDs found in %s", playlist_url)
+            # Don't cache: a consent/bot-challenge page may have caused the
+            # miss.  Leaving the cache empty means the next ingest will retry.
+            logger.warning(
+                "  [playlist] no video IDs found in %s — "
+                "YouTube may have returned a consent/challenge page "
+                "(HTML length: %d chars, first 200: %r)",
+                playlist_url, len(html), html[:200],
+            )
             return []
 
-        logger.info("  [playlist] found %d videos in %s", len(video_ids), playlist_url)
+        logger.info("  [playlist] found %d video(s) in %s", len(video_ids), playlist_url)
 
-        # Cache the raw playlist HTML so rebuild_index doesn't re-fetch
+        # Only cache when we have actual video IDs — stale/failed responses
+        # must not be cached or they'll silently block every future re-ingest.
         if self.cache:
             self.cache.set_page(playlist_url, playlist_url, html, "text/html")
 
-        docs = []
+        # Build list of not-yet-visited video URLs
+        urls_to_fetch = []
         for vid in video_ids:
             yt_url = f"https://www.youtube.com/watch?v={vid}"
-            if yt_url in self._visited:
-                continue
-            self._visited.add(yt_url)
+            if self._visited_add(yt_url):
+                urls_to_fetch.append(yt_url)
+
+        docs: list[ScrapedDocument] = []
+        if not urls_to_fetch:
+            return docs
+
+        def _do_video(yt_url: str) -> list[ScrapedDocument]:
             time.sleep(self.delay)
-            docs.extend(self._summarise_video(yt_url, section))
+            return self._summarise_video(yt_url, section)
+
+        logger.info("  [playlist threads] %d video(s), %d workers",
+                    len(urls_to_fetch), self.max_workers)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="vid"
+        ) as pool:
+            futures = {pool.submit(_do_video, u): u for u in urls_to_fetch}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    docs.extend(fut.result())
+                except Exception as exc:
+                    logger.error("  [video thread] %s: %s", futures[fut], exc)
 
         return docs
 
@@ -1056,15 +1129,62 @@ class PortfolioScraper:
     def _extract_playlist_video_ids(html: str) -> list[str]:
         """
         Extract ordered unique video IDs from YouTube playlist page HTML.
-        YouTube embeds JSON payloads with "videoId":"..." entries.
+
+        Tries four strategies in priority order, merging all results:
+
+        1. ytInitialData JSON blob  — most authoritative; YouTube inlines the
+           full playlist data as ``var ytInitialData = {...}`` in a <script> tag.
+           We locate the blob boundary (brace-depth walk) to avoid false positives
+           from other scripts on the page, then regex for "videoId" inside it.
+
+        2. "videoId": regex over the full HTML — catches the same entries even
+           if the ytInitialData boundary walk fails (e.g. truncated page).
+
+        3. href="/watch?v=XXXXXXXXXXX" links — playlist pages render anchor tags
+           for every video; these are present even when JS data is stripped.
+
+        4. data-video-id="..." attributes — used by some YouTube custom elements.
+
+        All four sets are merged in order, deduped while preserving first-seen
+        position.  An 11-character alphanumeric+dash+underscore ID is required
+        (standard YouTube video ID format).
         """
-        raw_ids = re.findall(r'"videoId"\s*:\s*"([\w\-]{11})"', html)
         seen: set[str] = set()
         unique: list[str] = []
-        for vid in raw_ids:
-            if vid not in seen:
-                seen.add(vid)
-                unique.append(vid)
+
+        def _add(ids: list[str]) -> None:
+            for vid in ids:
+                if len(vid) == 11 and vid not in seen:
+                    seen.add(vid)
+                    unique.append(vid)
+
+        # ── Strategy 1: ytInitialData JSON blob ───────────────────────
+        m = re.search(r'var ytInitialData\s*=\s*(\{)', html)
+        if m:
+            start = m.start(1)
+            depth = 0
+            end = start
+            for i, ch in enumerate(html[start:], start):
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end > start:
+                blob = html[start:end]
+                _add(re.findall(r'"videoId"\s*:\s*"([\w\-]{11})"', blob))
+
+        # ── Strategy 2: "videoId": anywhere in full HTML ──────────────
+        _add(re.findall(r'"videoId"\s*:\s*"([\w\-]{11})"', html))
+
+        # ── Strategy 3: href="/watch?v=..." anchor links ──────────────
+        _add(re.findall(r'href="[^"]*[?&]v=([\w\-]{11})', html))
+
+        # ── Strategy 4: data-video-id attributes ─────────────────────
+        _add(re.findall(r'data-video-id="([\w\-]{11})"', html))
+
         return unique
 
     # ------------------------------------------------------------------
@@ -1224,8 +1344,10 @@ class PortfolioScraper:
 
     def _make_doc(self, title: str, section: str, url: str, content: str,
                   doc_type: str, extra: Optional[dict] = None) -> ScrapedDocument:
-        self._doc_counter += 1
-        return ScrapedDocument(index=self._doc_counter, title=title, section=section,
+        with self._lock:
+            self._doc_counter += 1
+            idx = self._doc_counter
+        return ScrapedDocument(index=idx, title=title, section=section,
                                url=url, content=content, doc_type=doc_type, extra=extra or {})
 
     def _make_index_doc(self, soup: BeautifulSoup, url: str, section: str, title: str) -> ScrapedDocument:
@@ -1240,6 +1362,14 @@ class PortfolioScraper:
             if line and len(line) < 200:
                 return line
         return f"Video – {fallback_url}"
+
+    def _visited_add(self, url: str) -> bool:
+        """Thread-safe: add url to _visited. Returns True if newly added."""
+        with self._lock:
+            if url in self._visited:
+                return False
+            self._visited.add(url)
+            return True
 
     def _reset_session(self) -> None:
         self._doc_counter = 0

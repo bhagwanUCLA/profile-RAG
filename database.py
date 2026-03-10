@@ -253,6 +253,15 @@ class FAISSDatabase:
         to_del = [iid for iid, c in self._meta.items() if c.section == section]
         return self._remove_int_ids(to_del)
 
+    def delete_by_url(self, url: str) -> int:
+        """Remove all chunks whose doc_url matches `url` exactly."""
+        to_del = [iid for iid, c in self._meta.items() if c.doc_url == url]
+        return self._remove_int_ids(to_del)
+
+    def get_indexed_urls(self) -> set[str]:
+        """Return the set of all doc_url values currently in the index."""
+        return {c.doc_url for c in self._meta.values() if c.doc_url}
+
     def clear(self) -> None:
         self._index.reset()
         self._meta.clear()

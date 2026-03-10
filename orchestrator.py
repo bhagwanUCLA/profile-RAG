@@ -288,24 +288,75 @@ class RAGOrchestrator:
                     title = file_path.stem
                 content = re.sub(r"\n{3,}", "\n\n", raw).strip()
                 if not content:
+                    logger.warning("  [folder] empty text file: %s", file_path.name)
                     return None
                 return self._make_aux_doc(title, section, url, content, "text")
             except Exception as exc:
                 logger.warning("Failed to read %s: %s", file_path, exc)
                 return None
 
-        # ── Binary files — Gemini extraction ─────────────────────────
+        # ── Binary files — Gemini extraction + local fallback ────────
         if suffix in _BINARY_EXTENSIONS:
             try:
+                import mimetypes as _mt
                 file_bytes = file_path.read_bytes()
+                if not file_bytes:
+                    logger.warning("  [folder] empty file: %s", file_path.name)
+                    return None
+
+                # ── Cache hit: skip Gemini if we already extracted this file ─
+                if self.cache:
+                    cached = self.cache.get_page(url)
+                    if cached:
+                        cached_content = cached.get("html", "")
+                        from bs4 import BeautifulSoup as _BS
+                        cached_text = _BS(cached_content, "html.parser").get_text() if cached_content.startswith("<") else cached_content
+                        cached_title = cached.get("final_url", file_path.stem)  # we store title in final_url slot
+                        if cached_text:
+                            logger.info("  [folder cache HIT] %s", file_path.name)
+                            return self._make_aux_doc(cached_title, section, url, cached_text, "text")
+
+                # Derive an accurate MIME type so Gemini picks the right prompt
+                mime_hint = _mt.guess_type(file_path.name)[0] or ""
+                if suffix == ".pdf":
+                    mime_hint = "application/pdf"
+
+                logger.info("  [folder] Gemini extracting %s (%d KB)", file_path.name, len(file_bytes) // 1024)
                 title, content = self.scraper._file_stage3_gemini(
                     file_bytes,
                     str(file_path),
                     filename=file_path.name,
+                    mime_hint=mime_hint,
                     fallback_title=file_path.stem,
                 )
+
+                # ── Fallback: local PDF extraction if Gemini returns empty ──
+                if not content and suffix == ".pdf":
+                    logger.warning(
+                        "  [folder] Gemini returned empty for %s — "
+                        "falling back to local PDF extraction", file_path.name
+                    )
+                    from scraper import _pdf_stage1_pypdf, _pdf_stage2_pdfminer
+                    content = _pdf_stage1_pypdf(file_bytes) or _pdf_stage2_pdfminer(file_bytes)
+                    title = title or file_path.stem
+
                 if not content:
+                    logger.warning(
+                        "  [folder] all extraction methods returned empty for %s", file_path.name
+                    )
                     return None
+
+                # ── Cache the extracted content so re-runs skip Gemini ────────
+                # We repurpose the page cache: store plain text as "html",
+                # and the document title in the "final_url" slot.
+                if self.cache:
+                    self.cache.set_page(
+                        url=url,
+                        final_url=title or file_path.stem,   # title stored here
+                        content=content,                      # plain text (not HTML)
+                        content_type="x-local-file",
+                    )
+
                 return self._make_aux_doc(
                     title or file_path.stem, section, url, content, "text"
                 )
@@ -413,13 +464,20 @@ class RAGOrchestrator:
         )
 
     def _store_docs(self, docs: list[ScrapedDocument]) -> int:
-        """Chunk → embed → add to FAISS, then run short-chunk cleanup."""
+        """
+        Chunk → embed → upsert into FAISS, then run short-chunk cleanup.
+
+        Upsert semantics
+        ----------------
+        For each incoming document whose URL is already in the index, the
+        existing chunks are deleted before the new ones are added.  This
+        prevents duplicate embeddings from accumulating across re-ingests
+        while leaving unrelated documents untouched.
+        """
         if not docs:
             return 0
 
-        # Final safety net: drop any document whose content is binary junk.
-        # This catches corrupt pages that slipped through the scraper guards
-        # (e.g. old cache entries read before the corruption check was added).
+        # ── 1. Corruption guard ───────────────────────────────────────────
         clean_docs = [d for d in docs if not _is_corrupt_content(d.content)]
         skipped = len(docs) - len(clean_docs)
         if skipped:
@@ -431,6 +489,20 @@ class RAGOrchestrator:
         docs = clean_docs
         if not docs:
             return 0
+
+        # ── 2. Upsert: remove stale chunks for URLs already in the index ──
+        # Only do this when a URL is non-empty, so raw injected docs without
+        # a URL (url="") are always appended rather than clobbering each other.
+        already_indexed = self.db.get_indexed_urls()
+        total_removed = 0
+        for doc in docs:
+            if doc.url and doc.url in already_indexed:
+                removed = self.db.delete_by_url(doc.url)
+                if removed:
+                    logger.info(
+                        "  upsert: removed %d stale chunk(s) for %s", removed, doc.url
+                    )
+                    total_removed += removed
 
         chunks = self.chunker.chunk_documents(
             docs,
