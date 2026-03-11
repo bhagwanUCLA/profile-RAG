@@ -283,13 +283,15 @@ class FAISSDatabase:
             logger.info("[search] index is empty — returning []")
             return []
 
+        
+        q_vec   = self.embed_query(query)
+        fetch_k = min(top_k * 3, len(self._meta))
+        scores, int_ids = self._index.search(q_vec, fetch_k)
+
         logger.info(
             "[search] query=%r  top_k=%d  section_filter=%s",
-            query[:80], top_k, section_filter,
+            query[:80], fetch_k, section_filter,
         )
-        q_vec   = self.embed_query(query)
-        fetch_k = min(top_k * 10, len(self._meta))
-        scores, int_ids = self._index.search(q_vec, fetch_k)
 
         results = []
         for score, int_id in zip(scores[0], int_ids[0]):

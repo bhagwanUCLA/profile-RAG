@@ -21,7 +21,7 @@ import logging
 import os
 import textwrap
 from dataclasses import dataclass, field
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional
 
 from database import FAISSDatabase
 
@@ -250,6 +250,7 @@ class GeminiRAG:
         default_top_k: int,
         default_section: Optional[str],
         default_doc_type: Optional[str],
+        on_chunks: Optional[Callable[[list[dict]], None]] = None,
     ) -> tuple[str, list[Source]]:
         query    = tool_input.get("query", "")
         top_k    = int(tool_input.get("top_k", default_top_k))
@@ -258,7 +259,13 @@ class GeminiRAG:
 
         results = self._retrieve(query, top_k, section, doc_type)
         if not results:
+            if on_chunks:
+                on_chunks([])
             return "No relevant chunks found for this query.", []
+
+        # Notify caller with the raw result dicts before building context
+        if on_chunks:
+            on_chunks(results)
 
         return _build_context_block(results), _extract_sources(results)
 
@@ -359,11 +366,18 @@ class GeminiRAG:
         section_filter: Optional[str] = None,
         doc_type_filter: Optional[str] = None,
         session_id: Optional[str] = None,
+        on_chunks: Optional[Callable[[list[dict]], None]] = None,
     ) -> Generator[str, None, GeminiAnswer]:
         """
         Synchronous generator — MUST be driven from a background thread.
         See server.py _run_llm_in_thread() for the correct usage pattern.
         Yields text tokens; returns GeminiAnswer via StopIteration.value.
+
+        on_chunks: optional callback invoked every time Claude calls the
+        search_portfolio tool.  Called with the raw list[dict] results from
+        FAISSDatabase.search() so the caller can relay them to the client
+        (e.g. by putting them into the SSE queue).  The callback is invoked
+        in the background thread — it must be thread-safe.
         """
         return (yield from self._stream_claude(
             question,
@@ -371,6 +385,7 @@ class GeminiRAG:
             section_filter,
             doc_type_filter,
             session_id,
+            on_chunks=on_chunks,
         ))
 
     # ------------------------------------------------------------------
@@ -384,6 +399,7 @@ class GeminiRAG:
         default_section: Optional[str],
         default_doc_type: Optional[str],
         session_id: Optional[str],
+        on_chunks: Optional[Callable[[list[dict]], None]] = None,
     ) -> Generator[str, None, GeminiAnswer]:
         """
         Sync generator.  Yields tokens in real time.
@@ -392,6 +408,8 @@ class GeminiRAG:
           Claude emits NO text tokens during tool-use rounds.  Text only
           appears in the final end_turn round, so yielding immediately never
           leaks intermediate tool-call output to the client.
+
+        on_chunks: forwarded to _run_search_tool and fired on every tool call.
         """
         import anthropic
 
@@ -448,6 +466,7 @@ class GeminiRAG:
                                 default_top_k,
                                 default_section,
                                 default_doc_type,
+                                on_chunks=on_chunks,
                             )
                             all_sources.extend(sources)
                             tool_results.append({
@@ -494,7 +513,7 @@ class GeminiRAG:
         section_filter: Optional[str],
         doc_type_filter: Optional[str],
     ) -> list[dict]:
-        raw = self.db.search(question, top_k=k * 4, section_filter=section_filter)
+        raw = self.db.search(question, top_k=k, section_filter=section_filter)
         if doc_type_filter:
             raw = [r for r in raw if r.get("doc_type") == doc_type_filter]
         return raw[:k]

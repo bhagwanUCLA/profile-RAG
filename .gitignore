@@ -3,3 +3,4 @@ scraper_cache/
 *.pyc
 .env
 /frontend
+/video-demo

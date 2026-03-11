@@ -67,7 +67,7 @@ _DEFAULT_CONFIG = {
     "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "hf_model_name":     "gemini-embedding-001",
-    "chunk_size":        3500,
+    "chunk_size":        500,
     "chunk_overlap":     50,
     "dedup_threshold":   None,
     "min_tokens":        20,
@@ -193,10 +193,34 @@ def _run_llm_in_thread(
     """
     Runs stream_answer() synchronously in a worker thread.
     Puts items into token_queue:
+      ('chunk', dict)         — one retrieved chunk (from a tool call)
       ('token', str)          — one text token
       ('done',  GeminiAnswer) — generator exhausted normally
       ('error', str)          — exception message
+
+    The on_chunks callback is invoked by GeminiRAG every time Claude fires
+    the search_portfolio tool.  It serialises each result dict and puts a
+    ('chunk', payload_dict) item into the shared queue so the SSE loop can
+    forward them to the client in real time — interleaved with tokens.
     """
+    chunk_rank = [0]   # mutable counter shared across all tool calls
+
+    def on_chunks(results: list[dict]) -> None:
+        for r in results:
+            chunk_rank[0] += 1
+            payload = {
+                "rank":        chunk_rank[0],
+                "score":       r["score"],
+                "doc_index":   r["doc_index"],
+                "doc_title":   r["doc_title"],
+                "section":     r["section"],
+                "doc_type":    r["doc_type"],
+                "doc_url":     r["doc_url"],
+                "chunk_index": r["chunk_index"],
+                "raw_content": r["raw_content"],
+            }
+            token_queue.put(("chunk", payload))
+
     try:
         gen = g.stream_answer(
             question=question,
@@ -204,6 +228,7 @@ def _run_llm_in_thread(
             section_filter=section_filter,
             doc_type_filter=doc_type_filter,
             session_id=session_id,
+            on_chunks=on_chunks,
         )
         while True:
             try:
@@ -387,32 +412,11 @@ async def query_stream(
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
-            # ── 1. Retrieved chunks (fast, sync-safe) ────────────────
-            chunks = rag.query(
-                question=question,
-                top_k=top_k,
-                section_filter=section_filter,
-                doc_type_filter=doc_type_filter,
-            )
-            for i, r in enumerate(chunks):
-                payload = json.dumps({
-                    "rank":        i + 1,
-                    "score":       r["score"],
-                    "doc_index":   r["doc_index"],
-                    "doc_title":   r["doc_title"],
-                    "section":     r["section"],
-                    "doc_type":    r["doc_type"],
-                    "doc_url":     r["doc_url"],
-                    "chunk_index": r["chunk_index"],
-                    "raw_content": r["raw_content"],
-                })
-                yield f"event: chunk\ndata: {payload}\n\n"
-                await asyncio.sleep(0)
-
-            # ── 2. LLM streaming in a background thread ───────────────
-            # The Anthropic SDK is blocking.  We run the sync generator
-            # in a ThreadPoolExecutor and ferry results back via a Queue
-            # so the event loop is never blocked.
+            # ── LLM streaming in a background thread ─────────────────
+            # Chunks now arrive via the on_chunks callback inside the
+            # thread, which puts ("chunk", payload) into the queue.
+            # This means the UI shows exactly the chunks Claude retrieved,
+            # not a separate pre-retrieval pass.
             token_queue: _sync_queue.Queue = _sync_queue.Queue()
             loop = asyncio.get_event_loop()
 
@@ -437,7 +441,9 @@ async def query_stream(
                     await asyncio.sleep(0.05)
                     continue
 
-                if kind == "token":
+                if kind == "chunk":
+                    yield f"event: chunk\ndata: {json.dumps(value)}\n\n"
+                elif kind == "token":
                     yield f"event: token\ndata: {json.dumps(value)}\n\n"
                 elif kind == "done":
                     final_answer = value
