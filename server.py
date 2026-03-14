@@ -67,7 +67,7 @@ _DEFAULT_CONFIG = {
     "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "hf_model_name":     "gemini-embedding-001",
-    "chunk_size":        500,
+    "chunk_size":        3500,
     "chunk_overlap":     50,
     "dedup_threshold":   None,
     "min_tokens":        20,
