@@ -309,23 +309,32 @@ def action_by_title(db: FAISSDatabase, cache: ScraperCache, index_dir: str) -> N
     for iid, chunk in db._meta.items():
         title_map[chunk.doc_title or "?"].append(iid)
 
-    query = input("  Filter titles (leave blank for all): ").strip()
-    filtered = {t: iids for t, iids in title_map.items()
-                if not query or query.lower() in t.lower()}
-    if not filtered:
-        print(_red(f"  No titles match '{query}'.")); return
+    query = input("  Search titles (any words, partial match OK): ").strip().lower()
 
-    sorted_titles = sorted(filtered.keys())
+    if query:
+        # Score each title by how many query words appear in it
+        query_words = query.split()
+        def _score(t: str) -> int:
+            tl = t.lower()
+            return sum(w in tl for w in query_words)
+        scored = [(t, _score(t), iids) for t, iids in title_map.items() if _score(t) > 0]
+        if not scored:
+            print(_red(f"  No titles match \"{query}\".")); return
+        # Sort by score desc then alpha; cap at 20
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        candidates = [(t, iids) for t, _, iids in scored[:20]]
+    else:
+        candidates = sorted(title_map.items(), key=lambda x: x[0])[:20]
+
     options = [
-        f"{t[:70]:72}  {_dim(str(len(filtered[t])) + ' chunks')}"
-        for t in sorted_titles
+        f"{t[:70]:72}  {_dim(str(len(iids)) + ' chunks')}"
+        for t, iids in candidates
     ]
     idx = _pick(options, "Select document to delete")
     if idx is None:
         return
 
-    title = sorted_titles[idx]
-    iids  = filtered[title]
+    title, iids = candidates[idx]
     urls  = _db_urls_for_group(db, iids)
 
     print(f"\n  Title  : {_amber(title)}")

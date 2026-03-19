@@ -559,50 +559,6 @@ def query(body: QueryRequest):
 # Danger zone
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Skip-list endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/cache/skiplist")
-def list_skiplist():
-    """
-    List all URLs that are permanently excluded from re-scraping.
-
-    These are URLs that have been manually ingested via POST /ingest/documents.
-    The scraper will silently skip them on every future ingest/rebuild.
-    """
-    urls = _get_rag().list_skipped_urls()
-    return {"count": len(urls), "urls": urls}
-
-
-@app.post("/cache/skiplist")
-def add_to_skiplist(url: str):
-    """
-    Manually add a URL to the skip list without ingesting any content.
-    Useful for URLs you know are broken and want to permanently ignore.
-    """
-    _get_rag().add_skipped_url(url)
-    return {"added": url}
-
-
-@app.delete("/cache/skiplist/{url:path}")
-def remove_from_skiplist(url: str):
-    """
-    Remove a URL from the skip list so it will be re-scraped on the next ingest.
-    Use this if you previously ingested a page manually but now want the
-    scraper to handle it automatically.
-    """
-    removed = _get_rag().remove_skipped_url(url)
-    return {"removed": url, "was_present": removed}
-
-
-@app.delete("/cache/skiplist")
-def clear_skiplist():
-    """Remove all entries from the skip list."""
-    n = _get_rag().clear_skip_list()
-    return {"cleared": n}
-
-
 @app.get("/cache/corrupt")
 def audit_corrupt_cache():
     """

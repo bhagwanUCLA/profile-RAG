@@ -490,20 +490,6 @@ class RAGOrchestrator:
         if not docs:
             return 0
 
-        # ── 2. Upsert: remove stale chunks for URLs already in the index ──
-        # Only do this when a URL is non-empty, so raw injected docs without
-        # a URL (url="") are always appended rather than clobbering each other.
-        already_indexed = self.db.get_indexed_urls()
-        total_removed = 0
-        for doc in docs:
-            if doc.url and doc.url in already_indexed:
-                removed = self.db.delete_by_url(doc.url)
-                if removed:
-                    logger.info(
-                        "  upsert: removed %d stale chunk(s) for %s", removed, doc.url
-                    )
-                    total_removed += removed
-
         chunks = self.chunker.chunk_documents(
             docs,
             embed_fn=self.db.embed_one if self.chunker.dedup_threshold else None,

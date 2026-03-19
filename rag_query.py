@@ -61,7 +61,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     of portfolio content.
 
     Rules:
-    - Use the search_portfolio tool whenever you need information about the person.
+    - Use the search_portfolio tool whenever you need information about the person and there related work and stuff.
     - For purely conversational messages (greetings, follow-ups on what you just said,
       clarification requests that don't need new facts) you may answer directly
       without calling the tool.
@@ -82,10 +82,10 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 _SEARCH_TOOL = {
     "name": "search_portfolio",
     "description": (
-        "Search the portfolio vector database for relevant information about the person. "
+        "Search the portfolio vector database for relevant information about the person and there related work and stuff. "
         "Use this tool whenever you need to look up facts about their background, "
         "research, publications, employment, education, advising, teaching, opinions, "
-        "media appearances, or any other portfolio content. "
+        "media appearances,concepts, knowledge or any other portfolio content. "
         "Returns the most relevant text chunks from the database ranked by similarity. "
         "You may call it more than once per turn with different queries if needed. "
         "Do NOT call it for greetings or purely conversational messages."
