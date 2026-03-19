@@ -587,6 +587,161 @@ def action_stats(db: FAISSDatabase, cache: ScraperCache) -> None:
 # Main menu
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def action_quality_filter(db: FAISSDatabase, cache: ScraperCache, index_dir: str) -> None:
+    """Delete chunks whose content fails quality heuristics."""
+    _hr()
+    print(_bold("Quality filter — delete low-quality chunks"))
+    print(
+        "\n  Scans every chunk and flags ones that look like junk:\n"
+        "    • Repeated words  (same word appears N+ times)\n"
+        "    • High word-repetition ratio  (repeated words / total words > threshold)\n"
+        "    • Very short chunks  (fewer than N tokens)\n"
+        "    • Boilerplate patterns  (custom regex)\n"
+    )
+
+    # ── Configuration prompts ─────────────────────────────────────────────────
+    print(_bold("  Configure filters  (press Enter to skip a filter):\n"))
+
+    def _ask_int(prompt: str, default: int) -> Optional[int]:
+        raw = input(f"    {prompt} [default {default}, Enter to skip]: ").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            print(_red("      Invalid — skipping this filter."))
+            return None
+
+    def _ask_float(prompt: str, default: float) -> Optional[float]:
+        raw = input(f"    {prompt} [default {default:.0%}, Enter to skip]: ").strip()
+        if not raw:
+            return None
+        try:
+            v = float(raw.rstrip("%"))
+            return v / 100 if v > 1 else v
+        except ValueError:
+            print(_red("      Invalid — skipping this filter."))
+            return None
+
+    min_word_len = _ask_int(
+        "Ignore words shorter than N chars when counting repeats (e.g. 4 skips 'the','a','is')", 4
+    )
+    min_repeats = _ask_int(
+        "Delete if any single word repeats at least N times", 5
+    )
+    ratio_threshold = _ask_float(
+        "Delete if (repeated words / total words) exceeds % (e.g. 30)", 0.30
+    )
+    min_tokens = _ask_int(
+        "Delete if chunk has fewer than N words total", 20
+    )
+    pattern_raw = input(
+        "    Custom regex to flag (Enter to skip, e.g. cookie|GDPR): "
+    ).strip()
+    custom_pattern = None
+    if pattern_raw:
+        import re as _re
+        try:
+            custom_pattern = _re.compile(pattern_raw, _re.I)
+            print(_green(f"      Pattern compiled: {pattern_raw}"))
+        except Exception as exc:
+            print(_red(f"      Invalid regex ({exc}) — skipping."))
+
+    if not any([min_word_len, min_repeats, ratio_threshold, min_tokens, custom_pattern]):
+        print(_red("  No filters configured — nothing to do.")); return
+
+    # ── Scan all chunks ───────────────────────────────────────────────────────
+    import re as _re
+    import collections as _col
+
+    flagged: list[tuple[int, str, str]] = []  # (iid, reason, doc_title)
+
+    for iid, chunk in list(db._meta.items()):
+        text = (getattr(chunk, "raw_content", "") or getattr(chunk, "text", "") or "").strip()
+        if not text:
+            flagged.append((iid, "empty content", getattr(chunk, "doc_title", "?")))
+            continue
+
+        words = _re.findall(r"\b[a-zA-Z]+\b", text.lower())
+        total = len(words)
+
+        # Min tokens filter
+        if min_tokens and total < min_tokens:
+            flagged.append((iid, f"only {total} words (< {min_tokens})", getattr(chunk, "doc_title", "?")))
+            continue
+
+        # Word repetition filters
+        if min_word_len or min_repeats or ratio_threshold:
+            effective_min_len = min_word_len if min_word_len else 4
+            long_words = [w for w in words if len(w) >= effective_min_len]
+            counts = _col.Counter(long_words)
+            repeated = {w: c for w, c in counts.items() if c >= 2}
+
+            if min_repeats:
+                worst_word, worst_cnt = (counts.most_common(1)[0] if counts else ("", 0))
+                if worst_cnt >= min_repeats:
+                    flagged.append((iid,
+                        f"word '{worst_word}' repeats {worst_cnt}x (≥ {min_repeats})",
+                        getattr(chunk, "doc_title", "?")))
+                    continue
+
+            if ratio_threshold and total > 0:
+                repeated_total = sum(c - 1 for c in repeated.values())
+                ratio = repeated_total / total
+                if ratio >= ratio_threshold:
+                    flagged.append((iid,
+                        f"repetition ratio {ratio:.0%} (≥ {ratio_threshold:.0%})",
+                        getattr(chunk, "doc_title", "?")))
+                    continue
+
+        # Custom pattern
+        if custom_pattern and custom_pattern.search(text):
+            flagged.append((iid, f"matches pattern '{pattern_raw}'", getattr(chunk, "doc_title", "?")))
+
+    if not flagged:
+        print(_green("\n  ✓ No chunks flagged — index looks clean.")); return
+
+    # ── Show preview ──────────────────────────────────────────────────────────
+    print(f"\n  Found {_red(str(len(flagged)))} chunk(s) to delete:\n")
+    # Group by reason for readability
+    by_reason: dict[str, list] = _col.defaultdict(list)
+    for iid, reason, title in flagged:
+        by_reason[reason].append((iid, title))
+
+    for reason, items in sorted(by_reason.items(), key=lambda x: -len(x[1])):
+        print(f"    {_amber(str(len(items))):>5}  {_dim(reason)}")
+        for _, title in items[:3]:
+            print(f"           {title[:70]}")
+        if len(items) > 3:
+            print(f"           {_dim(f'… and {len(items)-3} more')}")
+        print()
+
+    # ── Preview sample chunk ──────────────────────────────────────────────────
+    if _yn("  Preview a sample flagged chunk?"):
+        iid, reason, title = flagged[0]
+        chunk = db._meta[iid]
+        text = (getattr(chunk, "raw_content", "") or getattr(chunk, "text", ""))[:400]
+        print(f"\n  Title  : {_amber(title)}")
+        print(f"  Reason : {_red(reason)}")
+        print(f"  Text   :\n{_dim(text)}")
+        print()
+
+    if not _yn(f"  Delete all {len(flagged)} flagged chunk(s) from the DB?"):
+        print("  Cancelled."); return
+
+    # ── Delete from DB ────────────────────────────────────────────────────────
+    iids_to_del = [iid for iid, _, _ in flagged]
+    urls_to_del = _db_urls_for_group(db, iids_to_del)
+    removed = _delete_db_iids(db, iids_to_del)
+    print(_green(f"  ✓ Removed {removed} chunks from DB."))
+
+    # ── Optionally purge cache for affected URLs ───────────────────────────────
+    _ask_also_delete_cache(cache, list(urls_to_del))
+
+    _save_db(db, index_dir)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="RAG index & cache manager")
     parser.add_argument("--index", default="./rag_index",   help="Path to FAISS index directory")
@@ -639,6 +794,7 @@ def main() -> None:
         ("Purge corrupt cache pages",                   lambda: action_corrupt_cache(cache)),
         ("Manage skip-list",                            lambda: action_skiplist(cache)),
         ("Show stats",                                  lambda: action_stats(db, cache)),
+        ("Quality filter — delete low-quality chunks",  lambda: action_quality_filter(db, cache, index_dir)),
     ]
 
     while True:
