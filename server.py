@@ -32,7 +32,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from orchestrator import RAGOrchestrator
@@ -260,6 +260,13 @@ def get_config():
         safe["anthropic_api_key"] = "***set***"
     return safe
 
+@app.get("/", response_class=HTMLResponse)
+def ingest_ui():
+    """Serve the document ingestion UI."""
+    html_path = Path(__file__).parent / "ingest_ui.html"
+    if not html_path.exists():
+        return HTMLResponse("<h1>ingest_ui.html not found next to server.py</h1>", status_code=404)
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 @app.post("/config")
 def update_config(body: ConfigUpdate):

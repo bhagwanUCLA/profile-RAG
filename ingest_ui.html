@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG Ingest</title>
+<style>
+  :root {
+    --bg: #f8f8f6;
+    --surface: #ffffff;
+    --border: #e2e2de;
+    --border2: #d0d0c8;
+    --text: #1a1a18;
+    --muted: #6b6b64;
+    --accent: #1a1a18;
+    --green: #1a7a40;
+    --green-bg: #eaf3de;
+    --red: #a32d2d;
+    --red-bg: #fcebeb;
+    --blue: #185fa5;
+    --blue-bg: #e6f1fb;
+    --mono: 'Courier New', monospace;
+    --sans: system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.6;
+    min-height: 100vh;
+    padding: 32px 16px 64px;
+  }
+  .container { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: var(--muted); margin-bottom: 32px; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  .tab {
+    padding: 10px 18px; font-size: 13px; font-weight: 500; cursor: pointer;
+    border: none; background: transparent; color: var(--muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color 0.12s;
+  }
+  .tab.active { color: var(--text); border-bottom-color: var(--text); }
+  .tab:hover { color: var(--text); }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+
+  label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 5px; }
+  .hint { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+
+  input[type=text], input[type=url], select, textarea {
+    width: 100%; border: 1px solid var(--border2); background: var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13px;
+    padding: 8px 10px; border-radius: 5px; outline: none;
+    transition: border-color 0.12s; margin-bottom: 12px;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
+
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+
+  .checks {
+    display: flex; flex-wrap: wrap; gap: 6px 14px;
+    padding: 10px 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 5px; margin-bottom: 10px;
+  }
+  .checks-label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; width: 100%; margin-bottom: 2px; }
+  .checks label {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 400; cursor: pointer; margin: 0;
+  }
+  .checks input[type=checkbox] { margin: 0; }
+
+  /* paste area: raw input on left, cleaned preview on right */
+  .paste-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .paste-grid textarea { margin-bottom: 0; height: 200px; }
+  .paste-grid-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 16px; border-radius: 5px; border: 1px solid var(--border2);
+    background: var(--surface); color: var(--text); font-family: var(--sans);
+    font-size: 13px; font-weight: 500; cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .btn:hover { background: var(--bg); border-color: var(--accent); }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: #333; border-color: #333; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+
+  .toast { padding: 10px 14px; border-radius: 5px; font-size: 13px; margin-top: 12px; display: none; }
+  .toast.ok   { background: var(--green-bg); color: var(--green); display: block; }
+  .toast.err  { background: var(--red-bg);   color: var(--red);   display: block; }
+  .toast.info { background: var(--blue-bg);  color: var(--blue);  display: block; }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+  .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .stat-val   { font-size: 20px; font-weight: 600; }
+
+  .section-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+  .sec-pill {
+    font-size: 11px; padding: 3px 10px; border-radius: 20px;
+    border: 1px solid var(--border2); cursor: pointer;
+    background: var(--surface); color: var(--muted); transition: all 0.12s;
+  }
+  .sec-pill:hover, .sec-pill.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border2); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+  .video-list { display: flex; flex-direction: column; gap: 6px; }
+  .video-row { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; }
+  .video-row input { flex: 1; margin: 0; }
+
+  .cleaner-stats { font-size: 11px; color: var(--muted); margin-top: 4px; min-height: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Portfolio RAG — Ingest</h1>
+  <p class="subtitle">Add documents, folders, videos, or paste raw text into the knowledge base.</p>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('documents')">Paste Documents</button>
+    <button class="tab" onclick="switchTab('folder')">Folder</button>
+    <button class="tab" onclick="switchTab('videos')">Videos</button>
+    <button class="tab" onclick="switchTab('portfolio')">Portfolio URL</button>
+    <button class="tab" onclick="switchTab('index')">Index</button>
+  </div>
+
+  <!-- ── PASTE DOCUMENTS (with inline cleaner) ── -->
+  <div id="panel-documents" class="panel active">
+    <div class="card">
+      <div class="card-title">Document details</div>
+      <div class="row">
+        <div>
+          <label>Title</label>
+          <input type="text" id="doc-title" placeholder="Document title">
+        </div>
+        <div>
+          <label>Section</label>
+          <select id="doc-section">
+            <option value="general">general</option>
+            <option value="biography">biography</option>
+            <option value="research">research</option>
+            <option value="working_papers">working_papers</option>
+            <option value="employment">employment</option>
+            <option value="education">education</option>
+            <option value="video">video</option>
+            <option value="opinion">opinion</option>
+            <option value="executive_teaching">executive_teaching</option>
+            <option value="advisor">advisor</option>
+            <option value="cases">cases</option>
+            <option value="associate_editor">associate_editor</option>
+            <option value="contact">contact</option>
+            <option value="fame">fame</option>
+          </select>
+        </div>
+      </div>
+      <label>Source URL <span style="color:var(--muted);font-weight:400">(optional — adds to skip list)</span></label>
+      <input type="url" id="doc-url" placeholder="https://…">
+    </div>
+
+    <div class="card">
+      <div class="card-title">Content — paste & clean</div>
+
+      <!-- Cleaner options inline -->
+      <div class="checks">
+        <span class="checks-label">Auto-clean options</span>
+        <label><input type="checkbox" id="ck-singlequote" checked> Remove single quotes</label>
+        <label><input type="checkbox" id="ck-backslash"   checked> Escape backslashes</label>
+        <label><input type="checkbox" id="ck-doublequote" checked> Escape double quotes</label>
+        <label><input type="checkbox" id="ck-trim"        checked> Trim &amp; remove blank lines</label>
+        <label><input type="checkbox" id="ck-joinlines"   checked> Join lines with \n</label>
+        <label><input type="checkbox" id="ck-tabs">        Replace tabs with spaces</label>
+        <label><input type="checkbox" id="ck-unicode">     Remove non-ASCII</label>
+        <label><input type="checkbox" id="ck-html">        Strip HTML tags</label>
+      </div>
+
+      <!-- Side-by-side: raw input | cleaned preview -->
+      <div class="paste-grid">
+        <div>
+          <div class="paste-grid-label">Raw input — paste here</div>
+          <textarea id="cleaner-in" placeholder="Paste raw text here…" oninput="runCleaner()"></textarea>
+        </div>
+        <div>
+          <div class="paste-grid-label">Cleaned preview (what gets ingested)</div>
+          <textarea id="cleaner-out" readonly placeholder="Cleaned output…"></textarea>
+        </div>
+      </div>
+      <div class="cleaner-stats" id="cleaner-stats"></div>
+
+      <div class="btn-group" style="margin-top:10px">
+        <button class="btn btn-primary" onclick="ingestDocuments()">
+          <span id="doc-spinner"></span> Ingest document
+        </button>
+        <button class="btn" onclick="clearDocForm()">Clear</button>
+      </div>
+      <div id="doc-toast" class="toast"></div>
+    </div>
+  </div>
+
+  <!-- ── FOLDER ── -->
+  <div id="panel-folder" class="panel">
+    <div class="card">
+      <div class="card-title">Ingest local folder</div>
+      <label>Folder path (server-side absolute path)</label>
+      <div class="hint">Must be accessible on the machine running the server, e.g. C:\Users\you\docs or /home/user/papers</div>
+      <input type="text" id="folder-path" placeholder="E:\Internship-Folder\RAG\papers">
+      <div class="row">
+        <div>
+          <label>Section</label>
+          <select id="folder-section">
+            <option value="research">research</option>
+            <option value="general">general</option>
+            <option value="biography">biography</option>
+            <option value="working_papers">working_papers</option>
+            <option value="employment">employment</option>
+            <option value="education">education</option>
+            <option value="opinion">opinion</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:flex-end;padding-bottom:12px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0">
+            <input type="checkbox" id="folder-recursive" checked> Recursive (include subfolders)
+          </label>
+        </div>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-primary" onclick="ingestFolder()">
+          <span id="folder-spinner"></span> Ingest folder
+        </button>
+      </div>
+      <div id="folder-toast" class="toast"></div>
+    </div>
+  </div>
+
+  <!-- ── VIDEOS ── -->
+  <div id="panel-videos" class="panel">
+    <div class="card">
+      <div class="card-title">YouTube videos &amp; playlists</div>
+      <label>Section</label>
+      <select id="video-section" style="margin-bottom:14px">
+        <option value="video">video</option>
+        <option value="general">general</option>
+      </select>
+      <label>URLs <span style="color:var(--muted);font-weight:400">(one per row)</span></label>
+      <div class="video-list" id="video-list">
+        <div class="video-row">
+          <input type="url" placeholder="https://youtube.com/watch?v=… or playlist URL">
+          <button class="btn btn-sm" onclick="removeVideoRow(this)">✕</button>
+        </div>
+      </div>
+      <div class="btn-group" style="margin-top:8px">
+        <button class="btn btn-sm" onclick="addVideoRow()">+ Add URL</button>
+        <button class="btn btn-primary" onclick="ingestVideos()">
+          <span id="video-spinner"></span> Ingest videos
+        </button>
+      </div>
+      <div id="video-toast" class="toast"></div>
+    </div>
+  </div>
+
+  <!-- ── PORTFOLIO URL ── -->
+  <div id="panel-portfolio" class="panel">
+    <div class="card">
+      <div class="card-title">Crawl portfolio website</div>
+      <label>Root URL</label>
+      <input type="url" id="portfolio-url" placeholder="https://bhagwanchowdhry.com">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px">
+        <input type="checkbox" id="portfolio-rebuild"> Rebuild index from scratch (wipe existing)
+      </label>
+      <div class="btn-group">
+        <button class="btn btn-primary" onclick="ingestPortfolio()">
+          <span id="portfolio-spinner"></span> Start crawl
+        </button>
+      </div>
+      <div id="portfolio-toast" class="toast"></div>
+    </div>
+  </div>
+
+  <!-- ── INDEX ── -->
+  <div id="panel-index" class="panel">
+    <div class="card">
+      <div class="card-title">Index stats</div>
+      <div class="stats-grid">
+        <div class="stat-box"><div class="stat-label">Total chunks</div><div class="stat-val" id="st-chunks">—</div></div>
+        <div class="stat-box"><div class="stat-label">Total docs</div><div class="stat-val" id="st-docs">—</div></div>
+        <div class="stat-box"><div class="stat-label">Cached pages</div><div class="stat-val" id="st-pages">—</div></div>
+        <div class="stat-box"><div class="stat-label">Cached videos</div><div class="stat-val" id="st-videos">—</div></div>
+      </div>
+      <div class="section-bar" id="section-bar"></div>
+      <hr>
+      <div class="card-title">Documents in index</div>
+      <div id="doc-list" style="max-height:400px;overflow-y:auto;font-size:12px;color:var(--muted)"></div>
+    </div>
+    <div class="btn-group">
+      <button class="btn" onclick="loadIndex()">↺ Refresh</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'http://127.0.0.1:8000';
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+  if (name === 'index') loadIndex();
+}
+
+function showToast(id, msg, type) {
+  const el = document.getElementById(id);
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+}
+
+function spin(id, on) {
+  document.getElementById(id).innerHTML = on ? '<span class="spinner"></span>' : '';
+}
+
+// ── TEXT CLEANER (runs live as user types) ───────────────────────────────
+function runCleaner() {
+  let t = document.getElementById('cleaner-in').value;
+  const get = id => document.getElementById(id).checked;
+
+  if (get('ck-html'))        t = t.replace(/<[^>]*>/g, ' ');
+  if (get('ck-singlequote')) t = t.replace(/'/g, '');
+  if (get('ck-backslash'))   t = t.replace(/\\/g, '\\\\');
+  if (get('ck-doublequote')) t = t.replace(/"/g, '\\"');
+  if (get('ck-tabs'))        t = t.replace(/\t/g, '    ');
+  if (get('ck-unicode'))     t = t.replace(/[^\x00-\x7F]/g, '');
+
+  let lines = t.split(/\r?\n/);
+  if (get('ck-trim')) lines = lines.map(l => l.trim()).filter(l => l.length > 0);
+  const result = get('ck-joinlines') ? lines.join('\\n') : lines.join('\n');
+
+  document.getElementById('cleaner-out').value = result;
+  const chars = result.length, words = result.split(/\s+/).filter(Boolean).length;
+  document.getElementById('cleaner-stats').textContent =
+    result ? `${chars.toLocaleString()} chars · ${words.toLocaleString()} words` : '';
+}
+
+document.querySelectorAll('.checks input[type=checkbox]').forEach(cb =>
+  cb.addEventListener('change', runCleaner)
+);
+
+// ── PASTE DOCUMENTS ───────────────────────────────────────────────────────
+async function ingestDocuments() {
+  // Use the cleaned version if available, otherwise raw input
+  const cleaned = document.getElementById('cleaner-out').value.trim();
+  const raw     = document.getElementById('cleaner-in').value.trim();
+  const content = cleaned || raw;
+  if (!content) return showToast('doc-toast', 'Content is required.', 'err');
+  spin('doc-spinner', true);
+  try {
+    const res = await fetch(API + '/ingest/documents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documents: [{
+        title:    document.getElementById('doc-title').value.trim() || 'Untitled',
+        content,
+        section:  document.getElementById('doc-section').value,
+        url:      document.getElementById('doc-url').value.trim(),
+        doc_type: 'text',
+      }]})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    showToast('doc-toast', `✓ Ingested — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+  } catch(e) {
+    showToast('doc-toast', '✕ ' + e.message, 'err');
+  }
+  spin('doc-spinner', false);
+}
+
+function clearDocForm() {
+  ['doc-title','doc-url','cleaner-in','cleaner-out'].forEach(id =>
+    document.getElementById(id).value = '');
+  document.getElementById('doc-section').value = 'general';
+  document.getElementById('doc-toast').className = 'toast';
+  document.getElementById('cleaner-stats').textContent = '';
+}
+
+// ── FOLDER ────────────────────────────────────────────────────────────────
+async function ingestFolder() {
+  const fp = document.getElementById('folder-path').value.trim();
+  if (!fp) return showToast('folder-toast', 'Folder path is required.', 'err');
+  spin('folder-spinner', true);
+  showToast('folder-toast', 'Ingesting… this may take a while for large folders.', 'info');
+  try {
+    const res = await fetch(API + '/ingest/folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folder_path: fp,
+        section:     document.getElementById('folder-section').value,
+        recursive:   document.getElementById('folder-recursive').checked,
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    showToast('folder-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+  } catch(e) {
+    showToast('folder-toast', '✕ ' + e.message, 'err');
+  }
+  spin('folder-spinner', false);
+}
+
+// ── VIDEOS ────────────────────────────────────────────────────────────────
+function addVideoRow() {
+  const row = document.createElement('div');
+  row.className = 'video-row';
+  row.innerHTML = '<input type="url" placeholder="https://youtube.com/…"><button class="btn btn-sm" onclick="removeVideoRow(this)">✕</button>';
+  document.getElementById('video-list').appendChild(row);
+}
+function removeVideoRow(btn) {
+  if (document.querySelectorAll('#video-list .video-row').length > 1)
+    btn.closest('.video-row').remove();
+}
+async function ingestVideos() {
+  const urls = [...document.querySelectorAll('#video-list input')]
+    .map(i => i.value.trim()).filter(Boolean);
+  if (!urls.length) return showToast('video-toast', 'Add at least one URL.', 'err');
+  spin('video-spinner', true);
+  showToast('video-toast', 'Ingesting videos… Gemini is transcribing each one.', 'info');
+  try {
+    const res = await fetch(API + '/ingest/videos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls, section: document.getElementById('video-section').value })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    showToast('video-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+  } catch(e) {
+    showToast('video-toast', '✕ ' + e.message, 'err');
+  }
+  spin('video-spinner', false);
+}
+
+// ── PORTFOLIO URL ─────────────────────────────────────────────────────────
+async function ingestPortfolio() {
+  const url = document.getElementById('portfolio-url').value.trim();
+  if (!url) return showToast('portfolio-toast', 'URL is required.', 'err');
+  spin('portfolio-spinner', true);
+  showToast('portfolio-toast', 'Crawling… this can take several minutes.', 'info');
+  try {
+    const res = await fetch(API + '/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, rebuild: document.getElementById('portfolio-rebuild').checked })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    showToast('portfolio-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+  } catch(e) {
+    showToast('portfolio-toast', '✕ ' + e.message, 'err');
+  }
+  spin('portfolio-spinner', false);
+}
+
+// ── INDEX ─────────────────────────────────────────────────────────────────
+async function loadIndex() {
+  try {
+    const res = await fetch(API + '/stats');
+    const s = await res.json();
+    document.getElementById('st-chunks').textContent  = (s.total_chunks   || 0).toLocaleString();
+    document.getElementById('st-docs').textContent    = (s.total_documents|| 0).toLocaleString();
+    document.getElementById('st-pages').textContent   = (s.cache?.cached_pages  || 0).toLocaleString();
+    document.getElementById('st-videos').textContent  = (s.cache?.cached_videos || 0).toLocaleString();
+
+    const secBar = document.getElementById('section-bar');
+    secBar.innerHTML = '';
+    Object.entries(s.sections || {}).sort((a,b) => b[1]-a[1]).forEach(([sec, cnt]) => {
+      const p = document.createElement('span');
+      p.className = 'sec-pill';
+      p.textContent = `${sec} (${cnt})`;
+      secBar.appendChild(p);
+    });
+
+    document.getElementById('doc-list').textContent =
+      'Use manage_rag.py CLI for full document listing and deletion.';
+  } catch(e) {
+    document.getElementById('doc-list').textContent = 'Could not load stats: ' + e.message;
+  }
+}
+</script>
+</body>
+</html>
