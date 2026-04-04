@@ -36,7 +36,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from orchestrator import RAGOrchestrator
-from rag_query import GeminiRAG
+from rag_query import RAG
 from dotenv import load_dotenv
 
 env_path = Path(__file__).parent / ".env"
@@ -75,8 +75,8 @@ _DEFAULT_CONFIG = {
     "cache_dir":         "./scraper_cache",
     "follow_external":   True,
     "device":            "cpu",
-    "gemini_model":      "claude-sonnet-4-6",
-    "top_k":             6,
+    "model":      "claude-sonnet-4-6",
+    "top_k":             10,
 }
 
 _current_config: dict          = dict(_DEFAULT_CONFIG)
@@ -103,13 +103,12 @@ def _get_rag() -> RAGOrchestrator:
 
 def _get_gemini_rag(
     system_prompt: Optional[str] = None,
-    model_override: Optional[str] = None,
-) -> GeminiRAG:
-    return GeminiRAG(
+) -> RAG:
+    return RAG(
         db=_get_rag().db,
         gemini_api_key=_current_config["gemini_api_key"],
         anthropic_api_key=_current_config["anthropic_api_key"],
-        gemini_model=model_override or _current_config["gemini_model"],
+        model= _current_config["model"],
         top_k=_current_config["top_k"],
         system_prompt=system_prompt,
     )
@@ -131,7 +130,7 @@ class ConfigUpdate(BaseModel):
     cache_dir:         Optional[str]   = None
     follow_external:   Optional[bool]  = None
     device:            Optional[str]   = None
-    gemini_model:      Optional[str]   = None
+    model:      Optional[str]   = None
     top_k:             Optional[int]   = None
 
 
@@ -146,7 +145,7 @@ class QueryRequest(BaseModel):
     section_filter:  Optional[str] = None
     doc_type_filter: Optional[str] = None
     system_prompt:   Optional[str] = None
-    gemini_model:    Optional[str] = None
+    model:    Optional[str] = None
     session_id:      Optional[str] = None
 
 
@@ -182,7 +181,7 @@ class VideosIngestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _run_llm_in_thread(
-    g: GeminiRAG,
+    g: RAG,
     question: str,
     top_k: int,
     section_filter: Optional[str],
@@ -198,7 +197,7 @@ def _run_llm_in_thread(
       ('done',  GeminiAnswer) — generator exhausted normally
       ('error', str)          — exception message
 
-    The on_chunks callback is invoked by GeminiRAG every time Claude fires
+    The on_chunks callback is invoked by RAG every time Claude fires
     the search_portfolio tool.  It serialises each result dict and puts a
     ('chunk', payload_dict) item into the shared queue so the SSE loop can
     forward them to the client in real time — interleaved with tokens.
@@ -407,7 +406,6 @@ async def query_stream(
     section_filter:  Optional[str] = None,
     doc_type_filter: Optional[str] = None,
     system_prompt:   Optional[str] = None,
-    gemini_model:    Optional[str] = None,
     session_id:      Optional[str] = None,
 ):
     """
@@ -415,7 +413,7 @@ async def query_stream(
     Events: chunk | token | done | error | ping
     """
     rag = _get_rag()
-    g   = _get_gemini_rag(system_prompt=system_prompt, model_override=gemini_model)
+    g   = _get_gemini_rag(system_prompt=system_prompt)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
@@ -504,7 +502,6 @@ def query(body: QueryRequest):
     rag = _get_rag()
     g   = _get_gemini_rag(
         system_prompt=body.system_prompt,
-        model_override=body.gemini_model,
     )
 
     chunks = rag.query(

@@ -490,19 +490,19 @@ class RAGOrchestrator:
         if not docs:
             return 0
 
-        chunks = self.chunker.chunk_documents(
-            docs,
-            embed_fn=self.db.embed_one if self.chunker.dedup_threshold else None,
-        )
-        self.db.add(chunks)
-        added_count = len(chunks)
-        logger.info("Stored %d chunks (before cleanup).", added_count)
+        # chunks = self.chunker.chunk_documents(
+        #     docs,
+        #     embed_fn=self.db.embed_one if self.chunker.dedup_threshold else None,
+        # )
+        # self.db.add(chunks)
+        # added_count = len(chunks)
+        # logger.info("Stored %d chunks (before cleanup).", added_count)
 
-        removed_short = self.db.remove_short_chunks(min_tokens=self.min_tokens)
-        if removed_short:
-            logger.info(
-                "Cleanup removed %d short/junk chunks after ingestion.", removed_short
-            )
+        # removed_short = self.db.remove_short_chunks(min_tokens=self.min_tokens)
+        # if removed_short:
+        #     logger.info(
+        #         "Cleanup removed %d short/junk chunks after ingestion.", removed_short
+        #     )
 
         net_added = max(0, added_count - removed_short)
         logger.info("Net chunks added: %d", net_added)
