@@ -30,10 +30,13 @@ import queue as _sync_queue
 from typing import AsyncGenerator, Optional
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
+import tempfile
+import zipfile
+import shutil
 
 from orchestrator import RAGOrchestrator
 from rag_query import RAG
@@ -322,31 +325,49 @@ def clear_all_sessions():
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest/folder")
-def ingest_folder(body: FolderIngestRequest):
+async def ingest_folder(
+    section: str = Form("general"),
+    recursive: bool = Form(True),
+    file: UploadFile = File(...)
+):
     """
-    Ingest all supported files from a server-side directory.
+    Ingest all supported files from an uploaded zip file.
 
     Supported: .txt .md .html .pdf .docx .doc .odt .pptx .ppt
                .xlsx .xls .xlsm .xlsb .csv .ods
 
     Binary files are extracted via Gemini; text files are read directly.
-    The folder_path must be accessible on the server's filesystem.
     """
     rag = _get_rag()
+    import logging
+    logger = logging.getLogger(__name__)
+
     try:
-        chunks = rag.ingest_folder(
-            folder_path=body.folder_path,
-            section=body.section,
-            recursive=body.recursive,
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "uploaded.zip")
+            with open(zip_path, "wb") as f:
+                f.write(await file.read())
+
+            extract_dir = os.path.join(tmpdir, "extracted")
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Invalid zip file.")
+
+            chunks = rag.ingest_folder(
+                folder_path=extract_dir,
+                section=section,
+                recursive=recursive,
+            )
     except ValueError as exc:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=str(exc))
+
     rag.save()
     return {
         "action":         "ingest_folder",
-        "folder_path":    body.folder_path,
-        "section":        body.section,
+        "folder_path":    file.filename,
+        "section":        section,
         "chunks_stored":  chunks,
         "stats":          rag.stats(),
     }

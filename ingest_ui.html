@@ -132,12 +132,12 @@
   <p class="subtitle">Add documents, folders, videos, or paste raw text into the knowledge base.</p>
 
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('documents')">Paste Documents</button>
-    <button class="tab" onclick="switchTab('folder')">Folder</button>
-    <button class="tab" onclick="switchTab('videos')">Videos</button>
-    <button class="tab" onclick="switchTab('portfolio')">Portfolio URL</button>
-    <button class="tab" onclick="switchTab('index')">Index</button>
-    <button class="tab" onclick="switchTab('cleanup')">Cleanup</button>
+    <button class="tab active" onclick="switchTab(event, 'documents')">Paste Documents</button>
+    <button class="tab" onclick="switchTab(event, 'folder')">Zip Folder</button>
+    <button class="tab" onclick="switchTab(event, 'videos')">Videos</button>
+    <button class="tab" onclick="switchTab(event, 'portfolio')">Portfolio URL</button>
+    <button class="tab" onclick="switchTab(event, 'index')">Index</button>
+    <button class="tab" onclick="switchTab(event, 'cleanup')">Cleanup</button>
   </div>
 
   <!-- ── PASTE DOCUMENTS (with inline cleaner) ── -->
@@ -215,10 +215,13 @@
   <!-- ── FOLDER ── -->
   <div id="panel-folder" class="panel">
     <div class="card">
-      <div class="card-title">Ingest local folder</div>
-      <label>Folder path (server-side absolute path)</label>
-      <div class="hint">Must be accessible on the machine running the server, e.g. C:\Users\you\docs or /home/user/papers</div>
-      <input type="text" id="folder-path" placeholder="E:\Internship-Folder\RAG\papers">
+      <div class="card-title">Ingest Zip Folder</div>
+      <p style="font-size: 13px; margin-bottom: 14px; background: var(--blue-bg); color: var(--blue); padding: 10px; border-radius: 6px;">
+        <strong>Instruction:</strong> Please upload a .zip file containing your folder or documents. The server will automatically unzip the file and read all supported text and binary documents inside.
+      </p>
+      <label>Zip File (Upload)</label>
+      <div class="hint">Select a .zip file from your computer.</div>
+      <input type="file" id="folder-zip" accept=".zip" style="margin-bottom:12px;">
       <div class="row">
         <div>
           <label>Section</label>
@@ -440,10 +443,10 @@ copyright \d{4}"></textarea>
 <script>
 const API = 'http://127.0.0.1:8000';
 
-function switchTab(name) {
+function switchTab(event, name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  event.target.classList.add('active');
+  if (event && event.currentTarget) event.currentTarget.classList.add('active');
   document.getElementById('panel-' + name).classList.add('active');
   if (name === 'index') loadIndex();
 }
@@ -523,19 +526,20 @@ function clearDocForm() {
 
 // ── FOLDER ────────────────────────────────────────────────────────────────
 async function ingestFolder() {
-  const fp = document.getElementById('folder-path').value.trim();
-  if (!fp) return showToast('folder-toast', 'Folder path is required.', 'err');
+  const fileInput = document.getElementById('folder-zip');
+  if (!fileInput.files.length) return showToast('folder-toast', 'Zip file is required.', 'err');
+  const file = fileInput.files[0];
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('section', document.getElementById('folder-section').value);
+  formData.append('recursive', document.getElementById('folder-recursive').checked);
+
   spin('folder-spinner', true);
-  showToast('folder-toast', 'Ingesting… this may take a while for large folders.', 'info');
+  showToast('folder-toast', 'Uploading and ingesting… this may take a while.', 'info');
   try {
     const res = await fetch(API + '/ingest/folder', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        folder_path: fp,
-        section:     document.getElementById('folder-section').value,
-        recursive:   document.getElementById('folder-recursive').checked,
-      })
+      body: formData // Fetch automatically configures boundary for multipart/form-data
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
