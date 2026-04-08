@@ -297,6 +297,42 @@ def stats():
     return _get_rag().stats()
 
 
+@app.get("/documents")
+def list_documents():
+    """
+    Returns a list of unique documents currently indexed.
+    Scans the FAISS metadata and groups by title.
+    """
+    db = _get_rag().db
+    docs = {}
+    for c in db._meta.values():
+        title = c.doc_title
+        if title not in docs:
+            docs[title] = {
+                "title":    title,
+                "section":  c.section,
+                "url":      c.doc_url,
+                "doc_type": c.doc_type,
+                "chunks":   0
+            }
+        docs[title]["chunks"] += 1
+    
+    # Convert to sorted list
+    result = list(docs.values())
+    result.sort(key=lambda x: x["title"].lower())
+    return result
+
+
+@app.delete("/documents/{doc_title:path}")
+def delete_document(doc_title: str):
+    """Delete all chunks for a specific document title."""
+    rag = _get_rag()
+    count = rag.db.delete_by_doc_title(doc_title)
+    rag.save()
+    return {"deleted_chunks": count, "title": doc_title}
+
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------

@@ -119,11 +119,17 @@
 
   hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 
-  .video-list { display: flex; flex-direction: column; gap: 6px; }
-  .video-row { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; }
-  .video-row input { flex: 1; margin: 0; }
-
   .cleaner-stats { font-size: 11px; color: var(--muted); margin-top: 4px; min-height: 16px; }
+
+  .doc-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  .doc-table th { text-align: left; padding: 8px; border-bottom: 2px solid var(--border); color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; }
+  .doc-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .doc-table tr:hover { background: rgba(0,0,0,0.02); }
+  .doc-table .actions { text-align: right; }
+  .doc-table .btn-del { color: var(--red); border: none; background: transparent; cursor: pointer; font-weight: 600; padding: 2px 5px; border-radius: 3px; }
+  .doc-table .btn-del:hover { background: var(--red-bg); }
+  .doc-title-link { color: var(--blue); text-decoration: none; font-weight: 500; }
+  .doc-title-link:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -441,7 +447,7 @@ copyright \d{4}"></textarea>
 </div>
 
 <script>
-const API = 'http://127.0.0.1:8000';
+const API = window.location.origin;
 
 function switchTab(event, name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -622,10 +628,51 @@ async function loadIndex() {
       secBar.appendChild(p);
     });
 
-    document.getElementById('doc-list').textContent =
-      'Use manage_rag.py CLI for full document listing and deletion.';
+    // Load actual document list
+    const dres = await fetch(API + '/documents');
+    const docs = await dres.json();
+    const listEl = document.getElementById('doc-list');
+    
+    if (!docs.length) {
+      listEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted)">Index is empty.</div>';
+      return;
+    }
+
+    let html = '<table class="doc-table"><thead><tr><th>Title</th><th>Section</th><th>Type</th><th>Chunks</th><th class="actions"></th></tr></thead><tbody>';
+    docs.forEach(d => {
+      const link = d.url ? `<a href="${d.url}" target="_blank" class="doc-title-link">${esc(d.title)}</a>` : esc(d.title);
+      html += `<tr>
+        <td>${link}</td>
+        <td><span class="sec-pill" style="cursor:default">${esc(d.section)}</span></td>
+        <td style="color:var(--muted)">${esc(d.doc_type)}</td>
+        <td>${d.chunks}</td>
+        <td class="actions">
+          <button class="btn-del" onclick="deleteDocument('${esc(d.title)}')">Delete</button>
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    listEl.innerHTML = html;
+
   } catch(e) {
-    document.getElementById('doc-list').textContent = 'Could not load stats: ' + e.message;
+    document.getElementById('doc-list').innerHTML = 
+      `<div style="color:var(--red);padding:10px">Could not load stats: ${e.message}</div>`;
+  }
+}
+
+async function deleteDocument(title) {
+  if (!confirm(`Are you sure you want to delete "${title}"? This will remove all associated chunks and cache entries.`)) return;
+  
+  try {
+    // Use encodeURIComponent because titles can have special characters/slashes
+    const res = await fetch(API + '/documents/' + encodeURIComponent(title), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Delete failed');
+    
+    // Refresh the list
+    loadIndex();
+  } catch(e) {
+    alert('Error: ' + e.message);
   }
 }
 
