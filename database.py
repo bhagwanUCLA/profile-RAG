@@ -1,30 +1,19 @@
 """
 database.py
 -----------
-FAISSDatabase — vector store backed by FAISS with Google Gemini embeddings.
+FAISSDatabase — vector store backed by FAISS with Google Gemini embeddings
+and BM25 keyword search (Hybrid Search).
 
 Embedding backend
 -----------------
 Uses the Gemini Embedding API (gemini-embedding-001) via google-genai.
 No local model is loaded — all embedding is done via API call.
 
-Key design points
------------------
-* Asymmetric task types — Gemini is instruction-tuned per task type:
-    embed()       uses  RETRIEVAL_DOCUMENT  (for indexing chunks)
-    embed_query() uses  RETRIEVAL_QUERY     (for search queries)
-  Using the correct task type per side is how the model is designed to work
-  and gives meaningfully better retrieval scores than using a single type.
-
-* Output dimensionality — default 3072 (full quality, already L2-normalised
-  by the API).  Can be reduced to 1536 or 768 via output_dimensionality param
-  to save storage; the class re-normalises in those cases too.
-
-* Batching — texts are sent in batches of `batch_size` (default 100) with
-  detailed progress logs so you can see exactly what is happening during ingest.
-
-Both embed() and embed_query() return L2-normalised float32 numpy arrays so
-inner-product search == cosine similarity.
+Hybrid Search
+-------------
+Combines FAISS (Cosine Similarity, weight 0.8) and BM25 (weight 0.2).
+Retrieves candidate pools from both dense and sparse indexes, min-max normalises 
+their scores to a [0,1] scale, and combines them for the final ranking.
 """
 from __future__ import annotations
 
@@ -37,6 +26,7 @@ from typing import List, Optional
 
 import faiss
 import numpy as np
+from rank_bm25 import BM25Okapi
 
 from google import genai
 from google.genai import types
@@ -51,11 +41,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _l2_normalise(vectors: np.ndarray) -> np.ndarray:
-    """Row-wise L2 normalisation.  Safe: zero rows stay zero."""
+    """Row-wise L2 normalisation. Safe: zero rows stay zero."""
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     return vectors / norms
 
+def _tokenize(text: str) -> list[str]:
+    """Simple whitespace/punctuation tokenizer for BM25."""
+    if not text:
+        return []
+    # Extract alphanumeric words
+    return re.findall(r'(?u)\b\w\w+\b', text.lower())
 
 # ---------------------------------------------------------------------------
 # FAISSDatabase
@@ -63,7 +59,7 @@ def _l2_normalise(vectors: np.ndarray) -> np.ndarray:
 
 class FAISSDatabase:
     """
-    Embedding + vector store for DocumentChunks.
+    Hybrid Embedding + Sparse vector store for DocumentChunks.
 
     Parameters
     ----------
@@ -109,9 +105,34 @@ class FAISSDatabase:
         self._index: faiss.IndexIDMap = faiss.IndexIDMap(faiss.IndexFlatIP(self._dim))
         self._meta:  dict[int, DocumentChunk] = {}
         self._next_id: int = 0
+        
+        # BM25 State
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_id_map: list[int] = []
 
         if index_path and Path(index_path).exists():
             self.load(index_path)
+
+    # -------------------------------------------------------------------------
+    # BM25 Management
+    # -------------------------------------------------------------------------
+
+    def _rebuild_bm25(self) -> None:
+        """Rebuilds the BM25 index from the current metadata."""
+        if not self._meta:
+            self._bm25 = None
+            self._bm25_id_map = []
+            return
+
+        corpus = []
+        self._bm25_id_map = []
+        for int_id, chunk in self._meta.items():
+            self._bm25_id_map.append(int_id)
+            # Use raw_content if available, fallback to text
+            text_to_index = getattr(chunk, "raw_content", chunk.text)
+            corpus.append(_tokenize(text_to_index))
+        
+        self._bm25 = BM25Okapi(corpus)
 
     # -------------------------------------------------------------------------
     # Embedding
@@ -123,14 +144,6 @@ class FAISSDatabase:
         task_type: str,
         label:     str = "embedding",
     ) -> np.ndarray:
-        """
-        Internal — call the Gemini Embedding API for a list of texts.
-
-        Sends texts in batches of self.batch_size and logs each batch so
-        you can track progress during a large ingest.
-
-        Returns float32 ndarray (N, dim), L2-normalised.
-        """
         if not texts:
             return np.zeros((0, self._dim), dtype="float32")
 
@@ -182,32 +195,13 @@ class FAISSDatabase:
         return combined
 
     def embed(self, texts: list[str]) -> np.ndarray:
-        """
-        Embed document texts using task_type=RETRIEVAL_DOCUMENT.
-
-        Call this when indexing chunks.  For search queries use embed_query().
-
-        Returns float32 ndarray (N, dim), L2-normalised.
-        """
         return self._call_gemini_embed(texts, task_type="RETRIEVAL_DOCUMENT", label="doc")
 
     def embed_query(self, query: str) -> np.ndarray:
-        """
-        Embed a single search query using task_type=RETRIEVAL_QUERY.
-
-        Gemini uses a different internal representation for queries vs. documents;
-        always use this method at query time, not embed().
-
-        Returns float32 ndarray (1, dim), L2-normalised.
-        """
         logger.info("[embed:query] %r", query[:100])
         return self._call_gemini_embed([query], task_type="RETRIEVAL_QUERY", label="query")
 
     def embed_one(self, text: str) -> list[float]:
-        """
-        Embed a single document string → Python list.
-        Used by DocumentChunker for chunk deduplication.
-        """
         return self.embed([text])[0].tolist()
 
     # -------------------------------------------------------------------------
@@ -215,7 +209,6 @@ class FAISSDatabase:
     # -------------------------------------------------------------------------
 
     def add(self, chunks: list[DocumentChunk]) -> None:
-        """Embed and add chunks; skip any already present (by chunk_id)."""
         existing = {c.chunk_id for c in self._meta.values()}
         new      = [c for c in chunks if c.chunk_id not in existing]
         if not new:
@@ -235,6 +228,7 @@ class FAISSDatabase:
             self._meta[int(int_id)] = chunk
 
         self._next_id += len(new)
+        self._rebuild_bm25()
         logger.info("add() done — index now contains %d chunk(s).", len(self._meta))
 
     def delete_by_chunk_id(self, chunk_ids: list[str]) -> int:
@@ -254,18 +248,17 @@ class FAISSDatabase:
         return self._remove_int_ids(to_del)
 
     def delete_by_url(self, url: str) -> int:
-        """Remove all chunks whose doc_url matches `url` exactly."""
         to_del = [iid for iid, c in self._meta.items() if c.doc_url == url]
         return self._remove_int_ids(to_del)
 
     def get_indexed_urls(self) -> set[str]:
-        """Return the set of all doc_url values currently in the index."""
         return {c.doc_url for c in self._meta.values() if c.doc_url}
 
     def clear(self) -> None:
         self._index.reset()
         self._meta.clear()
         self._next_id = 0
+        self._rebuild_bm25()
         logger.info("Index cleared.")
 
     # -------------------------------------------------------------------------
@@ -283,43 +276,89 @@ class FAISSDatabase:
             logger.info("[search] index is empty — returning []")
             return []
 
-        
-        q_vec   = self.embed_query(query)
-        fetch_k = min(top_k * 3, len(self._meta))
-        scores, int_ids = self._index.search(q_vec, fetch_k)
+        # Retrieve a broader candidate pool to ensure good hybrid overlap
+        fetch_k = min(top_k * 5, len(self._meta))
+        logger.info("[search] hybrid query=%r  top_k=%d  fetch_k=%d", query[:80], top_k, fetch_k)
 
-        logger.info(
-            "[search] query=%r  top_k=%d  section_filter=%s",
-            query[:80], fetch_k, section_filter,
-        )
+        # 1. Dense Search (FAISS)
+        q_vec = self.embed_query(query)
+        dense_scores_raw, dense_ids_raw = self._index.search(q_vec, fetch_k)
+        
+        dense_map = {
+            int(iid): float(score) 
+            for score, iid in zip(dense_scores_raw[0], dense_ids_raw[0]) 
+            if iid != -1
+        }
+
+        # 2. Sparse Search (BM25)
+        sparse_map = {}
+        all_sparse_scores = {}
+        if self._bm25:
+            tokenized_query = _tokenize(query)
+            scores = self._bm25.get_scores(tokenized_query)
+            for idx, score in enumerate(scores):
+                all_sparse_scores[self._bm25_id_map[idx]] = float(score)
+            
+            # Get top fetch_k BM25 results
+            top_sparse_iids = sorted(all_sparse_scores, key=all_sparse_scores.get, reverse=True)[:fetch_k]
+            sparse_map = {iid: all_sparse_scores[iid] for iid in top_sparse_iids}
+
+        # 3. Union & Filter Candidates
+        candidate_ids = set(dense_map.keys()).union(set(sparse_map.keys()))
+        min_dense = min(dense_map.values()) if dense_map else 0.0
+
+        candidates = []
+        for iid in candidate_ids:
+            chunk = self._meta.get(iid)
+            if not chunk: continue
+            if section_filter and chunk.section != section_filter: continue
+            if doc_index_filter is not None and chunk.doc_index != doc_index_filter: continue
+
+            # Backfill missing scores
+            d_score = dense_map.get(iid, min_dense)
+            s_score = all_sparse_scores.get(iid, 0.0)
+            candidates.append((iid, d_score, s_score, chunk))
+
+        if not candidates:
+            return []
+
+        # 4. Min-Max Normalise Scores to [0, 1] range
+        d_min = min(c[1] for c in candidates)
+        d_max = max(c[1] for c in candidates)
+        s_min = min(c[2] for c in candidates)
+        s_max = max(c[2] for c in candidates)
+
+        def _normalize(val: float, vmin: float, vmax: float) -> float:
+            return (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
 
         results = []
-        for score, int_id in zip(scores[0], int_ids[0]):
-            if int_id == -1:
-                continue
-            chunk = self._meta.get(int(int_id))
-            if chunk is None:
-                continue
-            if section_filter and chunk.section != section_filter:
-                continue
-            if doc_index_filter is not None and chunk.doc_index != doc_index_filter:
-                continue
-            results.append({
-                "score":       float(score),
-                "chunk_id":    chunk.chunk_id,
-                "doc_index":   chunk.doc_index,
-                "doc_title":   chunk.doc_title,
-                "section":     chunk.section,
-                "doc_type":    chunk.doc_type,
-                "doc_url":     chunk.doc_url,
-                "chunk_index": chunk.chunk_index,
-                "text":        chunk.text,
-                "raw_content": chunk.raw_content,
-            })
-            if len(results) >= top_k:
-                break
+        for iid, d_score, s_score, chunk in candidates:
+            nd_score = _normalize(d_score, d_min, d_max)
+            ns_score = _normalize(s_score, s_min, s_max)
 
-        logger.info("[search] returning %d result(s)  top score=%.4f",
+            # Combined score: 80% Dense, 20% Sparse
+            final_score = (0.8 * nd_score) + (0.2 * ns_score)
+
+            results.append({
+                "score":        float(final_score),
+                "dense_score":  float(d_score),
+                "sparse_score": float(s_score),
+                "chunk_id":     chunk.chunk_id,
+                "doc_index":    chunk.doc_index,
+                "doc_title":    chunk.doc_title,
+                "section":      chunk.section,
+                "doc_type":     chunk.doc_type,
+                "doc_url":      chunk.doc_url,
+                "chunk_index":  chunk.chunk_index,
+                "text":         chunk.text,
+                "raw_content":  chunk.raw_content,
+            })
+
+        # 5. Sort by hybrid score and trim to top_k
+        results.sort(key=lambda x: x["score"], reverse=True)
+        results = results[:top_k]
+
+        logger.info("[search] returning %d result(s)  top hybrid score=%.4f", 
                     len(results), results[0]["score"] if results else 0.0)
         return results
 
@@ -341,6 +380,7 @@ class FAISSDatabase:
             "sections":        sections,
             "embedding_dim":   self._dim,
             "model":           self.model_name,
+            "bm25_indexed":    self._bm25 is not None,
         }
 
     # -------------------------------------------------------------------------
@@ -366,6 +406,10 @@ class FAISSDatabase:
             state = pickle.load(f)
         self._meta    = state["meta"]
         self._next_id = state["next_id"]
+        
+        # Hydrate the BM25 index after loading metadata
+        self._rebuild_bm25()
+        
         logger.info("Index loaded ← %s  (%d chunks)", directory, len(self._meta))
 
     # -------------------------------------------------------------------------
@@ -382,11 +426,14 @@ class FAISSDatabase:
             logger.warning("FAISS remove_ids raised: %s — metadata still removed", exc)
         for iid in int_ids:
             self._meta.pop(iid, None)
+            
+        # Ensure BM25 stays synced with deletions
+        self._rebuild_bm25()
+        
         logger.info("Removed %d chunk(s) from index.", len(int_ids))
         return len(int_ids)
 
     def remove_docs_with_few_chunks(self, min_chunks: int = 20) -> int:
-        """Remove all chunks belonging to documents with fewer than min_chunks chunks."""
         if not self._meta or min_chunks <= 0:
             return 0
         doc_buckets: dict[int, List[int]] = {}
@@ -410,7 +457,6 @@ class FAISSDatabase:
         min_chars:      int            = 30,
         extra_patterns: Optional[List] = None,
     ) -> int:
-        """Remove chunks that are too short or match junk regex patterns."""
         if not self._meta:
             return 0
         patterns: list = []

@@ -14,3 +14,4 @@ python-dotenv>=1.0.0
 gunicorn
 anthropic
 python-multipart
+rank-bm25
