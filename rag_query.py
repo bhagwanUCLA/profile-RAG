@@ -292,7 +292,7 @@ class RAG:
         import anthropic
 
         k        = top_k or self.top_k
-        client   = anthropic.Anthropic(api_key=self._anthropic_key)
+        client   = anthropic.Anthropic(api_key=self._anthropic_key, max_retries=5)
         history  = self._get_history(session_id)
         messages = list(history) + [{"role": "user", "content": question}]
 
@@ -421,7 +421,7 @@ class RAG:
         """
         import anthropic
 
-        client   = anthropic.Anthropic(api_key=self._anthropic_key)
+        client   = anthropic.Anthropic(api_key=self._anthropic_key, max_retries=5)
         history  = self._get_history(session_id)
         messages = list(history) + [{"role": "user", "content": question}]
 
@@ -496,7 +496,17 @@ class RAG:
                     break
 
         except Exception as exc:
-            err = f"\n[Error: {exc}]"
+            import anthropic
+            msg = str(exc)
+            
+            # Specific handling for Anthropic provider errors
+            if isinstance(exc, anthropic.APIStatusError):
+                if getattr(exc, "type", "") == "overloaded_error" or "Overloaded" in msg:
+                    msg = "Bhagwan's AI provider is currently very busy (overloaded). Please wait a moment and try again."
+                else:
+                    msg = f"AI Provider Error: {msg}"
+            
+            err = f"\n\n**System Notice:** {msg}"
             full_text.append(err)
             yield err
 
