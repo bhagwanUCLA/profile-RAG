@@ -185,11 +185,11 @@
       <!-- Cleaner options inline -->
       <div class="checks">
         <span class="checks-label">Auto-clean options</span>
-        <label><input type="checkbox" id="ck-singlequote" checked> Remove single quotes</label>
-        <label><input type="checkbox" id="ck-backslash"   checked> Escape backslashes</label>
-        <label><input type="checkbox" id="ck-doublequote" checked> Escape double quotes</label>
+        <label><input type="checkbox" id="ck-singlequote"> Remove single quotes</label>
+        <label><input type="checkbox" id="ck-backslash">   Escape backslashes</label>
+        <label><input type="checkbox" id="ck-doublequote"> Escape double quotes</label>
         <label><input type="checkbox" id="ck-trim"        checked> Trim &amp; remove blank lines</label>
-        <label><input type="checkbox" id="ck-joinlines"   checked> Join lines with \n</label>
+        <label><input type="checkbox" id="ck-joinlines"> Join lines (collapse to single line)</label>
         <label><input type="checkbox" id="ck-tabs">        Replace tabs with spaces</label>
         <label><input type="checkbox" id="ck-unicode">     Remove non-ASCII</label>
         <label><input type="checkbox" id="ck-html">        Strip HTML tags</label>
@@ -481,7 +481,7 @@ function runCleaner() {
 
   let lines = t.split(/\r?\n/);
   if (get('ck-trim')) lines = lines.map(l => l.trim()).filter(l => l.length > 0);
-  const result = get('ck-joinlines') ? lines.join('\\n') : lines.join('\n');
+  const result = get('ck-joinlines') ? lines.join(' ') : lines.join('\n');
 
   document.getElementById('cleaner-out').value = result;
   const chars = result.length, words = result.split(/\s+/).filter(Boolean).length;
