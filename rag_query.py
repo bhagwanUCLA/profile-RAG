@@ -199,7 +199,7 @@ _claude_histories: dict[str, list[dict]] = {}
 # Main class
 # ---------------------------------------------------------------------------
 
-class RAG:
+class GeminiRAG:
     """
     Retrieval-augmented generation using FAISSDatabase + Anthropic Claude tool-use.
 
