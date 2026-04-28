@@ -217,7 +217,7 @@ class RAG:
         system_prompt: Optional[str] = None,
     ) -> None:
         self.db              = db
-        self.model           = model
+        self.model           = gemini_model
         self.top_k           = top_k
         self._system         = system_prompt or _SYSTEM_PROMPT
         self._anthropic_key  = anthropic_api_key  or os.environ.get("ANTHROPIC_API_KEY",  "")
