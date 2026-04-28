@@ -56,30 +56,22 @@ class GeminiAnswer:
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
-Act as **Bhagwan Chowdhry**, Finance Professor at ISB and UCLA. Embody intellectual enthusiasm and a deep commitment to human welfare—especially for the marginalized.
+    You are a helpful assistant answering questions about a person's portfolio.
+    You have access to a `search_portfolio` tool that searches a vector database
+    of portfolio content.
 
-### **Voice & Style**
-* **Conversational Authority:** Blend personal narrative with financial principles. Start with anecdotes or credentials to establish intimacy.
-* **Sentence Structure:** Use medium-length sentences (15–25 words) balanced by short, punchy declaratives. 
-* **Punctuation:** Employ em-dashes for clarifying asides—and use rhetorical questions to engage.
-* **No Jargon:** Explain technical terms naturally; favor active voice and confident phrasing like "completely serious" or "nothing short of revolutionary."
-* **Tone:** Measured optimism with a touch of wit. Acknowledge limitations while asserting expertise.
-
-### **Content Focus**
-* **Concrete Grounding:** Use specific numbers, named people, and places. 
-* **Actionable Ideas:** Move from abstract theory to specific solutions like the **Financial Access at Birth (FAB)** initiative or **FinTech for Billions**. 
-* **Human Impact:** Always connect financial systems to the welfare of the poor. End with future-focused projections that inspire action.
-
-### **Operational Rules**
-* **Tool Use:** You are encouraged to perform **multiple queries** within a single conversation to ensure depth. Call `search_portfolio` for every query and answer **ONLY** from the returned data.
-* **Strict Constraints:** Never make up information. If the tool returns no data, explicitly state that you were not previously aware of the topic or have not received that information. **Never** use the word "context" in your response.
-* **Speculation:** If you choose to speculate beyond the provided data, you must explicitly state that you have "no ground for this" and that it is "pure speculation."
-* **Engagement:** Be concise. If an answer is long, engage in a conversation—delivering information in digestible pieces rather than a single wall of text.
-* **Continuity:** Reference previous conversation history and related work where relevant.
-
-### **IMPORTANT NOTE**
-If your answer came from your general training knowledge, not from my portfolio database, say so explicitly. Do not wait for the reader yo prod you first
-
+    Rules:
+    - Use the search_portfolio tool whenever you need information about the person.
+    - For purely conversational messages (greetings, follow-ups on what you just said,
+      clarification requests that don't need new facts) you may answer directly
+      without calling the tool.
+    - When you use the tool, answer ONLY from the returned chunks.
+    - If the tool returns no relevant information, say so clearly.
+    - When you reference information, cite the source using its [index] number shown
+      in the chunk headers.
+    - Be concise but complete.
+    - Remember the full conversation history and refer back to it when relevant.
+    - Do not fabricate any information not present in the retrieved chunks.
 """)
 
 
@@ -90,10 +82,10 @@ If your answer came from your general training knowledge, not from my portfolio 
 _SEARCH_TOOL = {
     "name": "search_portfolio",
     "description": (
-        "Search the portfolio vector database for relevant information about the person and there related work and stuff. "
+        "Search the portfolio vector database for relevant information about the person. "
         "Use this tool whenever you need to look up facts about their background, "
         "research, publications, employment, education, advising, teaching, opinions, "
-        "media appearances,concepts, knowledge or any other portfolio content. "
+        "media appearances, or any other portfolio content. "
         "Returns the most relevant text chunks from the database ranked by similarity. "
         "You may call it more than once per turn with different queries if needed. "
         "Do NOT call it for greetings or purely conversational messages."
@@ -133,6 +125,16 @@ _SEARCH_TOOL = {
             },
         },
         "required": ["query"],
+    },
+}
+
+
+_SEARCH_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name":        _SEARCH_TOOL["name"],
+        "description": _SEARCH_TOOL["description"],
+        "parameters":  _SEARCH_TOOL["input_schema"],
     },
 }
 
@@ -197,11 +199,11 @@ _claude_histories: dict[str, list[dict]] = {}
 # Main class
 # ---------------------------------------------------------------------------
 
-class RAG:
+class GeminiRAG:
     """
     Retrieval-augmented generation using FAISSDatabase + Anthropic Claude tool-use.
 
-    Named RAG for API compatibility with server.py.
+    Named GeminiRAG for API compatibility with server.py.
     """
 
     def __init__(
@@ -209,15 +211,17 @@ class RAG:
         db: FAISSDatabase,
         gemini_api_key: str = "",        # ignored — kept for server.py compat
         anthropic_api_key: str = "",
-        model: str = "claude-sonnet-4-6",
+        openrouter_api_key: str = "",
+        gemini_model: str = "claude-sonnet-4-6",
         top_k: int = 6,
         system_prompt: Optional[str] = None,
     ) -> None:
-        self.db             = db
-        self.model          = model
-        self.top_k          = top_k
-        self._system        = system_prompt or _SYSTEM_PROMPT
-        self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self.db              = db
+        self.model           = gemini_model
+        self.top_k           = top_k
+        self._system         = system_prompt or _SYSTEM_PROMPT
+        self._anthropic_key  = anthropic_api_key  or os.environ.get("ANTHROPIC_API_KEY",  "")
+        self._openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
 
     # ------------------------------------------------------------------
     # Session management
@@ -289,10 +293,15 @@ class RAG:
         doc_type_filter: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> GeminiAnswer:
+        if "/" in self.model:
+            return self._answer_openrouter(
+                question, top_k or self.top_k,
+                section_filter, doc_type_filter, session_id,
+            )
         import anthropic
 
         k        = top_k or self.top_k
-        client   = anthropic.Anthropic(api_key=self._anthropic_key, max_retries=5)
+        client   = anthropic.Anthropic(api_key=self._anthropic_key)
         history  = self._get_history(session_id)
         messages = list(history) + [{"role": "user", "content": question}]
 
@@ -387,6 +396,15 @@ class RAG:
         (e.g. by putting them into the SSE queue).  The callback is invoked
         in the background thread — it must be thread-safe.
         """
+        if "/" in self.model:
+            return (yield from self._stream_openrouter(
+                question,
+                top_k or self.top_k,
+                section_filter,
+                doc_type_filter,
+                session_id,
+                on_chunks=on_chunks,
+            ))
         return (yield from self._stream_claude(
             question,
             top_k or self.top_k,
@@ -421,7 +439,7 @@ class RAG:
         """
         import anthropic
 
-        client   = anthropic.Anthropic(api_key=self._anthropic_key, max_retries=5)
+        client   = anthropic.Anthropic(api_key=self._anthropic_key)
         history  = self._get_history(session_id)
         messages = list(history) + [{"role": "user", "content": question}]
 
@@ -496,22 +514,216 @@ class RAG:
                     break
 
         except Exception as exc:
-            import anthropic
-            msg = str(exc)
-            
-            # Specific handling for Anthropic provider errors
-            if isinstance(exc, anthropic.APIStatusError):
-                if getattr(exc, "type", "") == "overloaded_error" or "Overloaded" in msg:
-                    msg = "Bhagwan's AI provider is currently very busy (overloaded). Please wait a moment and try again."
-                else:
-                    msg = f"AI Provider Error: {msg}"
-            
-            err = f"\n\n**System Notice:** {msg}"
+            err = f"\n[Error: {exc}]"
             full_text.append(err)
             yield err
 
         if final_content:
             self._save_turn(session_id, question, final_content)
+
+        return GeminiAnswer(
+            question=question,
+            answer="".join(full_text),
+            sources=all_sources,
+            total_tokens_used=tokens_used,
+        )
+
+    # ------------------------------------------------------------------
+    # OpenRouter — non-streaming answer
+    # ------------------------------------------------------------------
+
+    def _answer_openrouter(
+        self,
+        question: str,
+        default_top_k: int,
+        default_section: Optional[str],
+        default_doc_type: Optional[str],
+        session_id: Optional[str],
+    ) -> GeminiAnswer:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self._openrouter_key,
+            default_headers={"HTTP-Referer": "https://profile-rag", "X-Title": "ProfileRAG"},
+        )
+
+        history     = self._get_history(session_id)
+        messages    = list(history) + [{"role": "user", "content": question}]
+        sys_msgs    = [{"role": "system", "content": self._system}] + messages
+        all_sources: list[Source] = []
+        tokens_used: int          = 0
+
+        logger.info("OpenRouter answer [%s] session=%s", self.model, session_id)
+
+        try:
+            while True:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    messages=sys_msgs,
+                    tools=[_SEARCH_TOOL_OPENAI],
+                    tool_choice="auto",
+                )
+                choice = response.choices[0]
+                msg    = choice.message
+                if response.usage:
+                    tokens_used += (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
+
+                if choice.finish_reason == "stop":
+                    answer_text = msg.content or ""
+                    self._save_turn(session_id, question, [{"type": "text", "text": answer_text}])
+                    return GeminiAnswer(
+                        question=question, answer=answer_text,
+                        sources=all_sources, total_tokens_used=tokens_used,
+                    )
+
+                if choice.finish_reason == "tool_calls" and msg.tool_calls:
+                    sys_msgs.append({
+                        "role": "assistant", "content": msg.content,
+                        "tool_calls": [
+                            {"id": tc.id, "type": "function",
+                             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                            for tc in msg.tool_calls
+                        ],
+                    })
+                    for tc in msg.tool_calls:
+                        if tc.function.name == "search_portfolio":
+                            try:    tool_input = json.loads(tc.function.arguments)
+                            except: tool_input = {}
+                            logger.info("OpenRouter tool call: %s", tool_input)
+                            context, sources = self._run_search_tool(
+                                tool_input, default_top_k, default_section, default_doc_type,
+                            )
+                            all_sources.extend(sources)
+                            sys_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": context})
+                        else:
+                            sys_msgs.append({"role": "tool", "tool_call_id": tc.id,
+                                             "content": f"Unknown tool: {tc.function.name}"})
+                else:
+                    logger.warning("OpenRouter unexpected finish_reason: %s", choice.finish_reason)
+                    break
+        except Exception as exc:
+            logger.error("OpenRouter answer failed: %s", exc)
+            return GeminiAnswer(question=question, answer=f"Error: {exc}", sources=all_sources)
+
+        return GeminiAnswer(question=question, answer="(no response)",
+                            sources=all_sources, total_tokens_used=tokens_used)
+
+    # ------------------------------------------------------------------
+    # OpenRouter — streaming answer
+    # ------------------------------------------------------------------
+
+    def _stream_openrouter(
+        self,
+        question: str,
+        default_top_k: int,
+        default_section: Optional[str],
+        default_doc_type: Optional[str],
+        session_id: Optional[str],
+        on_chunks: Optional[Callable[[list[dict]], None]] = None,
+    ) -> Generator[str, None, GeminiAnswer]:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self._openrouter_key,
+            default_headers={"HTTP-Referer": "https://profile-rag", "X-Title": "ProfileRAG"},
+        )
+
+        history     = self._get_history(session_id)
+        messages    = list(history) + [{"role": "user", "content": question}]
+        sys_msgs    = [{"role": "system", "content": self._system}] + messages
+        all_sources: list[Source] = []
+        tokens_used: int          = 0
+        full_text:   list[str]    = []
+
+        logger.info("OpenRouter stream [%s] session=%s", self.model, session_id)
+
+        try:
+            while True:
+                stream = client.chat.completions.create(
+                    model=self.model, max_tokens=2048, messages=sys_msgs,
+                    tools=[_SEARCH_TOOL_OPENAI], tool_choice="auto", stream=True,
+                )
+
+                finish_reason  = None
+                content_parts: list[str]       = []
+                tc_acc:        dict[int, dict] = {}   # index → {id, name, arguments}
+
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta  = chunk.choices[0].delta
+                    reason = chunk.choices[0].finish_reason
+
+                    # Text token — yield immediately
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        full_text.append(delta.content)
+                        yield delta.content
+
+                    # Accumulate tool-call argument fragments
+                    if delta.tool_calls:
+                        for tcd in delta.tool_calls:
+                            i = tcd.index
+                            if i not in tc_acc:
+                                tc_acc[i] = {"id": "", "name": "", "arguments": ""}
+                            if tcd.id:
+                                tc_acc[i]["id"] = tcd.id
+                            if tcd.function:
+                                if tcd.function.name:
+                                    tc_acc[i]["name"] += tcd.function.name
+                                if tcd.function.arguments:
+                                    tc_acc[i]["arguments"] += tcd.function.arguments
+
+                    if reason is not None:
+                        finish_reason = reason
+
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        tokens_used += (
+                            (chunk.usage.prompt_tokens or 0)
+                            + (chunk.usage.completion_tokens or 0)
+                        )
+
+                assistant_content = "".join(content_parts)
+
+                if finish_reason == "stop":
+                    self._save_turn(session_id, question,
+                                    [{"type": "text", "text": assistant_content}])
+                    break
+
+                if finish_reason == "tool_calls" and tc_acc:
+                    sys_msgs.append({
+                        "role": "assistant", "content": assistant_content or None,
+                        "tool_calls": [
+                            {"id": tc["id"], "type": "function",
+                             "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                            for tc in tc_acc.values()
+                        ],
+                    })
+                    for tc in tc_acc.values():
+                        if tc["name"] == "search_portfolio":
+                            try:    tool_input = json.loads(tc["arguments"])
+                            except: tool_input = {}
+                            logger.info("OpenRouter stream tool: %s", tool_input)
+                            context, sources = self._run_search_tool(
+                                tool_input, default_top_k, default_section, default_doc_type,
+                                on_chunks=on_chunks,
+                            )
+                            all_sources.extend(sources)
+                            sys_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": context})
+                        else:
+                            sys_msgs.append({"role": "tool", "tool_call_id": tc["id"],
+                                             "content": f"Unknown tool: {tc['name']}"})
+                else:
+                    logger.warning("OpenRouter stream unexpected finish_reason: %s", finish_reason)
+                    break
+
+        except Exception as exc:
+            err = f"\n\n**System Notice:** {exc}"
+            full_text.append(err)
+            yield err
 
         return GeminiAnswer(
             question=question,
@@ -531,7 +743,7 @@ class RAG:
         section_filter: Optional[str],
         doc_type_filter: Optional[str],
     ) -> list[dict]:
-        raw = self.db.search(question, top_k=k, section_filter=section_filter)
+        raw = self.db.search(question, top_k=k * 4, section_filter=section_filter)
         if doc_type_filter:
             raw = [r for r in raw if r.get("doc_type") == doc_type_filter]
         return raw[:k]

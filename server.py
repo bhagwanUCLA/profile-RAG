@@ -69,6 +69,7 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 _DEFAULT_CONFIG = {
     "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "openrouter_api_key": os.environ.get("OPENROUTER_API_KEY", ""),
     "hf_model_name":     "gemini-embedding-001",
     "chunk_size":        3500,
     "chunk_overlap":     50,
@@ -111,7 +112,8 @@ def _get_gemini_rag(
         db=_get_rag().db,
         gemini_api_key=_current_config["gemini_api_key"],
         anthropic_api_key=_current_config["anthropic_api_key"],
-        model= _current_config["model"],
+        openrouter_api_key=_current_config["openrouter_api_key"],
+        model=_current_config["model"],
         top_k=_current_config["top_k"],
         system_prompt=system_prompt,
     )
@@ -122,19 +124,20 @@ def _get_gemini_rag(
 # ---------------------------------------------------------------------------
 
 class ConfigUpdate(BaseModel):
-    gemini_api_key:    Optional[str]   = None
-    anthropic_api_key: Optional[str]   = None
-    hf_model_name:     Optional[str]   = None
-    chunk_size:        Optional[int]   = None
-    chunk_overlap:     Optional[int]   = None
-    dedup_threshold:   Optional[float] = None
-    min_tokens:        Optional[int]   = None
-    index_dir:         Optional[str]   = None
-    cache_dir:         Optional[str]   = None
-    follow_external:   Optional[bool]  = None
-    device:            Optional[str]   = None
-    model:      Optional[str]   = None
-    top_k:             Optional[int]   = None
+    gemini_api_key:     Optional[str]   = None
+    anthropic_api_key:  Optional[str]   = None
+    openrouter_api_key: Optional[str]   = None
+    hf_model_name:      Optional[str]   = None
+    chunk_size:         Optional[int]   = None
+    chunk_overlap:      Optional[int]   = None
+    dedup_threshold:    Optional[float] = None
+    min_tokens:         Optional[int]   = None
+    index_dir:          Optional[str]   = None
+    cache_dir:          Optional[str]   = None
+    follow_external:    Optional[bool]  = None
+    device:             Optional[str]   = None
+    model:              Optional[str]   = None
+    top_k:              Optional[int]   = None
 
 
 class IngestRequest(BaseModel):
@@ -260,6 +263,8 @@ def get_config():
         safe["gemini_api_key"] = "***set***"
     if safe.get("anthropic_api_key"):
         safe["anthropic_api_key"] = "***set***"
+    if safe.get("openrouter_api_key"):
+        safe["openrouter_api_key"] = "***set***"
     return safe
 
 @app.get("/", response_class=HTMLResponse)
@@ -556,17 +561,7 @@ async def query_stream(
 
 @app.post("/query")
 def query(body: QueryRequest):
-    rag = _get_rag()
-    g   = _get_gemini_rag(
-        system_prompt=body.system_prompt,
-    )
-
-    chunks = rag.query(
-        question=body.question,
-        top_k=body.top_k,
-        section_filter=body.section_filter,
-        doc_type_filter=body.doc_type_filter,
-    )
+    g = _get_gemini_rag(system_prompt=body.system_prompt)
 
     result = g.answer(
         question=body.question,
@@ -580,21 +575,6 @@ def query(body: QueryRequest):
         "question":    body.question,
         "answer":      result.answer,
         "tokens_used": result.total_tokens_used,
-        "chunks": [
-            {
-                "rank":        i + 1,
-                "score":       r["score"],
-                "doc_index":   r["doc_index"],
-                "doc_title":   r["doc_title"],
-                "section":     r["section"],
-                "doc_type":    r["doc_type"],
-                "doc_url":     r["doc_url"],
-                "chunk_index": r["chunk_index"],
-                "raw_content": r["raw_content"],
-                "full_text":   r["text"],
-            }
-            for i, r in enumerate(chunks)
-        ],
         "sources": [
             {
                 "doc_index": s.doc_index,
