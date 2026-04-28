@@ -560,10 +560,17 @@ class RAG:
             while True:
                 response = client.chat.completions.create(
                     model=self.model,
-                    max_tokens=2048,
                     messages=sys_msgs,
                     tools=[_SEARCH_TOOL_OPENAI],
                     tool_choice="auto",
+                    extra_body={
+                        "provider": {
+                            "sort": "throughput"
+                        },
+                        "reasoning": {
+                            "enabled": True
+                        }
+                    }
                 )
                 choice = response.choices[0]
                 msg    = choice.message
@@ -643,8 +650,15 @@ class RAG:
         try:
             while True:
                 stream = client.chat.completions.create(
-                    model=self.model, max_tokens=2048, messages=sys_msgs,
-                    tools=[_SEARCH_TOOL_OPENAI], tool_choice="auto", stream=True,
+                    model=self.model, messages=sys_msgs,
+                    tools=[_SEARCH_TOOL_OPENAI], tool_choice="auto", stream=True, extra_body={
+          "provider": {
+            "sort": "throughput"
+          },
+          "reasoning": {
+            "enabled": True
+          }
+        }
                 )
 
                 finish_reason  = None
