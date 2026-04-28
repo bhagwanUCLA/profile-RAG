@@ -79,7 +79,7 @@ _DEFAULT_CONFIG = {
     "cache_dir":         "./scraper_cache",
     "follow_external":   True,
     "device":            "cpu",
-    "model":      "moonshotai/kimi-k2.6",
+    "model":      "claude-sonnet-4-6",
     "top_k":             10,
 }
 
