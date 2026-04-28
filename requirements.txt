@@ -15,4 +15,3 @@ gunicorn
 anthropic
 python-multipart
 rank-bm25
-openai>=1.0.0
