@@ -203,7 +203,7 @@ class RAG:
     """
     Retrieval-augmented generation using FAISSDatabase + Anthropic Claude tool-use.
 
-    Named RAG for API compatibility with server.py.
+    Named GeminiRAG for API compatibility with server.py.
     """
 
     def __init__(
@@ -212,7 +212,7 @@ class RAG:
         gemini_api_key: str = "",        # ignored — kept for server.py compat
         anthropic_api_key: str = "",
         openrouter_api_key: str = "",
-        model: str = "claude-sonnet-4-6",
+        gemini_model: str = "claude-sonnet-4-6",
         top_k: int = 6,
         system_prompt: Optional[str] = None,
     ) -> None:
